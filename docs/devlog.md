@@ -1,0 +1,212 @@
+# Devlog
+
+每天三行：卡在哪 · 怎么解决 · 明天做什么。
+Week 4 写技术博客时，这里是全部素材来源。
+
+---
+
+## 2026-10-14 · D1 · Monorepo + 基础设施骨架
+
+**做了什么**
+uv workspace（4 个成员）+ FastAPI `/health`、`/api/chat` + Next.js 16 聊天页 + 可切换存储层（SQLite / 内存 / 本地文件，零外部服务）+ docker-compose（备用，Week 4 部署）+ routing eval 种子数据 24 条。浏览器实测端到端往返通过，CORS preflight 正常，SQLite checkpointer 用真实 LangGraph 图跑通持久化往返，`tsc --noEmit` 与 `ruff check` / `format --check` 全绿。
+
+**卡在哪 / 怎么解决**
+
+1. **系统 Python 是 3.14，LangGraph 生态没有对应 wheel。**
+   → 写 `.python-version = 3.12`，让 uv 自己下载 3.12 建 venv。**不要**试图用系统解释器。
+
+2. **`uv sync` 装完是空的。**
+   → workspace 根是 virtual project（`package = false`，无依赖），`uv sync` 只装根的依赖，四个成员一个都不装。必须 `uv sync --all-packages`。已写进 README，这是个会反复踩的坑。
+
+3. **Docker 没装 —— 后来发现根本不需要。**
+   → 机器上有个 `postgresql-x64-16` 服务但是 Stopped，而且 Windows 原生 PG 不带 pgvector。
+   → 真正的解法不是装 Docker，是**把存储后端做成可切换的**：`packages/agent/src/paper_agent/storage.py` 里 checkpoint / cache / blob 各有本地实现（SQLite / 内存 LRU+TTL / 本地文件系统）和生产实现（Postgres / Redis / S3），靠环境变量选，调用点不变。
+   → **D7 的 checkpoint 验收标准已提前达成**：用真实 LangGraph 图跑通了 SQLite 往返（invoke → 落盘 → `get_state()` 恢复）。Docker 降级为 Week 4 的部署问题。
+   → 意外收获：装 `langgraph-checkpoint-sqlite` 时顺带进来 **`sqlite-vec`**，Week 3 的向量检索本机也能跑，不必等 Postgres。
+
+4. **`curl -d '{...中文...}'` 在 Git Bash 里报 `There was an error parsing the body`（400）。**
+   → 不是后端问题（同端点对空 message 正确返回 422）。是 Git Bash 对含中文和嵌套引号的单引号 JSON 处理有问题。
+   → 用 `--data-binary @payload.json` 从文件读。**以后所有 curl 测试都走文件，别在命令行内联 JSON。**
+
+5. **ruff 0.17 会格式化 Markdown 里的 Python 代码块。**
+   → 它想重排 `docs/PLAN-WEEK1.md` 里的示例代码，把我对齐的注释全打乱。
+   → `[tool.ruff] extend-exclude = ["docs"]`。教学文档里的代码可读性优先于风格一致。
+
+6. **browser-use 的 `click` 报 `NATIVE_BROWSER_VIEWPORT_UNAVAILABLE`。**
+   → 内置浏览器视口不可见（0x0），指针类操作全部失效，但 `take_snapshot` 和 `evaluate_script` 可用。
+   → 改用 `evaluate_script` 驱动。**注意 React 受控输入不能直接赋 value**，必须拿 `HTMLInputElement.prototype` 的 native setter 再 dispatch `input` 事件，否则 React 收不到。
+   → 另外别在 `evaluate_script` 里调 `location.reload()`，会销毁脚本上下文报 "Inspected target navigated or closed"，要用 `navigate_page`。
+
+7. **`uv add` 报 `拒绝访问 (os error 5)`，删不掉 `websockets/speedups.cp312-win_amd64.pyd`。**
+   → 正在运行的 uvicorn 把 DLL 锁住了，Windows 特有（POSIX 下可以删除已打开的文件）。
+   → **先 `taskkill` 停 dev server，再装依赖，装完重启。** 以后所有 `uv add` 前都要先停服务。
+
+8. **★ 上面那次失败把 `.venv` 装坏了，而且暴露了一个会长期咬人的坑。**
+   → 症状：`uv pip list` 里同时出现 `websockets 16.1.1` 和 `17.2`，且 17.2 的 dist-info 缺 `RECORD` 文件，uv 报 "Installation may result in an incomplete environment"，之后每次 `uv run` 都失败。
+   → **根因不只是文件锁**：`uv run --package api` 只解析 api 的依赖，`uv sync --all-packages` 解析全 workspace 并集，两者对 websockets 的约束不同（langgraph 要 `<17`，uvicorn[standard] 允许 `>=17`）。交替使用会让 uv 反复装卸同一个包 —— 在 Windows 上迟早撞锁。
+   → **修复**：`rm -rf .venv && uv sync --all-packages` 重建（`uv.lock` 保证可复现）。
+   → **新纪律**：`uv sync --all-packages` 只在依赖变更时手动跑，**平时一律 `uv run --no-sync ...`**。已写进 README 和坑速查表。
+
+9. **`Path.as_uri()` 对相对路径抛 `ValueError: relative path can't be expressed as a file URI`。**
+   → `LocalBlobStore` 初始化时 `Path(root).resolve()`，返回值直接用 `str(dest)`。顺手写了路径穿越测试：key 传 `../../escape.txt` 必须被 `Path(key).name` 削平，留在 root 内 —— 已验证逃不出去。
+
+10. **FastAPI 0.143 的 `include_router` 不再把路由展平进 `app.routes`。**
+    → 里面变成一个 `_IncludedRouter` 对象，导致我用 `[r.path for r in app.routes]` 做冒烟测试时看不到 `/api/chat`，一度以为路由没注册。
+    → 实际 openapi 和真实 POST 都正常。**检查路由要用 `app.openapi()['paths']`，不要遍历 `app.routes`。**
+
+11. **★ 本机其实装了 PostgreSQL 16，但它已经起不来了 —— 而修它并不是正解。**
+    → 起因：用户提到 `D:\PostgreSQL\16`。如果能用，Week 3 就有真 pgvector，`CHECKPOINT_BACKEND` 也能换成生产的 `PostgresSaver`。
+    → 表层现象：`net start postgresql-x64-16` 报「系统找不到指定的文件」。`sc qc` 一看，服务 `ImagePath` 指向 `C:\Program Files\PostgreSQL\16\bin\pg_ctl.exe` —— 而 `installation_summary.log` 证实原始安装确实在 C 盘，**整棵树后来被搬到了 D 盘，但服务登记和 `data/postmaster.pid` 都没跟着改**。
+    → 真正致命的是另一层：`postgres.exe` 退出码 `-1073741515` = `0xC0000135` = DLL 缺失。我用 PowerShell 逐个 `LoadLibrary` 它的依赖做二分，定位到 `icuuc67.dll` / `icuin67.dll` 失败（win32 err 126），根因是它们依赖的 **`icudt67.dll`（约 28MB ICU 数据库）在整棵树、整个 C 盘、System32 里都不存在**。同目录其他 ICU DLL 时间戳都是原始的 Sep 1 16:50 —— 搬迁时唯独漏了这个大文件。ICU 严格锁主版本，D 盘上找到的 `icudt71/73/75.dll` 都不能替。
+    → **踩坑**：Git Bash 里跑原生 exe 报的 `error while loading shared libraries: liblz4.dll` 是**误导性的**。同一环境下连 `cmd.exe` 都这么报，而 `liblz4.dll` 用 `LoadLibrary` 一试完全正常。MSYS 的报错文案不可信，**必须用 PowerShell 拿 `$LASTEXITCODE` 换真实 Win32 状态码**。
+    → **决定不修**（用户拍板）。理由不是修不了，是**修了也没用**：`lib/` 里没有 `vector.dll`、`share/extension/` 里没有 `vector.control`，pgvector 压根没装。查了官方 README —— **Windows 无预编译包**，只有 `nmake /F Makefile.win` 源码编译这一条路，而本机没有任何 Visual Studio / `cl.exe` / `nmake.exe`。装 Build Tools（2-7GB）再编译要半天到一天，而 Week 3 的价值全在检索**设计**（hybrid → RRF → rerank → 质量自评估）上，不在向量存在哪个引擎里。
+    → 替代方案实测通过：SQLite 3.50.4 + `sqlite-vec` 0.1.9（`vec0` 虚表 KNN 排序正确）+ FTS5 `bm25()`。**意外收获**：SQLite 的 `bm25()` 返回负数（越负越相关），不是经典正分 —— 但 RRF 只消费排名不消费分值，所以无害。这反过来印证了之前「用 RRF 而不是加权分数融合」的判断：BM25 无界、余弦在 `[-1,1]`，直接加权本就脆弱。
+    → 全程只做了只读诊断，没有改动 PG 安装。
+
+12. **接上 DeepSeek key，顺手挖出两个会在 D3/D4 咬人的坑。**
+    → key 只写进 `.env`（已确认被 `.gitignore:22` 排除）。`config.py` 里改用 `SecretStr`，实测 `repr(settings)` 和 `model_dump()` 都渲染成 `**********`，不会顺着日志或 Langfuse trace 漏出去。
+    → **没有给 DeepSeek 单开一个 provider 分支**：它是 OpenAI 兼容的，所以配置形状是「一个 `LLM_BASE_URL` + 一个 client」，换 OpenAI/OpenRouter/本地 Ollama 只改 base_url，调用点不动。同时删掉了 `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `DEFAULT_CHAT_MODEL` 三个占位字段——没人引用，留着只会让人以为有多 provider 抽象。
+    → 验证做了四件事：`/user/balance` 200、普通对话 200、**工具调用**、以及一条「不该触发工具」的对照。工具调用完全正确：`format_citation` 的参数、`gb-t-7714` 枚举值、8 位作者、年份全对；对照组「你好你能做什么」正确返回纯文本，**没有过度触发**。Fast Path 的地基是稳的。
+    → **坑 A：`GET /models` 只返回 `deepseek-flash` 和 `deepseek-v4-pro`。** 我一开始按习惯配了 `deepseek-chat` / `deepseek-reasoner`，两个都返回 HTTP 200 且能正常工具调用——**它们是未列出的遗留别名，不会报错，所以配错了也不知道**。以后一律以 `/models` 为准。
+    → **坑 B（更贵）：`deepseek-v4-pro` 第一次测工具调用时没触发**，只输出文本。差点判定成「v4-pro 不支持工具调用」。真实原因是我把 `max_tokens` 设成了 120，而**两个模型都产出 `reasoning_content`，推理 token 是计入 `max_tokens` 预算的**——额度被推理烧光，根本来不及发 tool call。放到 1000 之后 2/2 次都正确调用，`finish_reason=tool_calls`。
+      **教训：判断「模型不调工具」之前先看 `finish_reason`。是 `length` 就是截断（配置问题），是 `stop` 才是真的没调用（能力/prompt 问题）。** 已把 `LLM_MAX_TOKENS=2048` 写进配置。
+    → 顺带发现 `deepseek-reasoner` 那次返回了 `cache_hit=128`，说明重复前缀会命中 prompt cache（命中价约为未命中的 1/50）。系统提示词和工具 schema 要保持**前缀稳定**，别在里面塞时间戳之类会变的东西，否则缓存全废。
+    → `/health` 加了 `llm` 段：只暴露 base_url、两个模型名和 `key_present` 布尔值，**不暴露 key**。D3 排查时一眼能分清「凭据没加载」和「上游调用失败」。
+
+13. **补上测试（D1 收尾），第一版就抓到一个真 bug。**
+    → 加了 4 个测试文件（storage / config / api / routing 数据），`testpaths` 补上 `packages/agent`。**101 passed, 1 skipped in 0.9s**，ruff 全绿。
+    → **真抓到 bug**：`LocalBlobStore` 用 `Path(key).name` 削平 key，我以为这样就逃不出 root 了。错 —— **`Path("..").name == ".."`，`Path(".").name == "."`**，根本没被削平，`dest` 直接指向 root 或它的父目录，最后在 `write_bytes` 里炸一个跟 key 毫无关系的 `PermissionError`。
+      修法是加 `_safe_name()`：显式拒 `""` / `"."` / `".."`，顺带拒 **Win32 保留设备名**（`CON` `NUL` `COM1` `LPT9`…）。后者不是理论问题：Windows 的路径解析器会把这些名字重定向到设备，`open("CON","w")` 会挂到控制台上，**在没有控制头的服务里可能把请求挂死而不是报错**。
+    → **顺手修了依赖归属**：`langgraph` / `langgraph-checkpoint-sqlite` 原本声明在 `apps/api`，但真正 `import` 它们的是 `packages/agent/storage.py`。之前能跑只是因为 workspace venv 装的是全集。移到 `packages/agent`，`apps/api` 靠 `paper-agent` 传递依赖。改完确认 venv 无抖动（websockets 仍只有 16.1.1）。
+    → **两个失败，判断方向相反，这是这次最值钱的部分**：
+      - `test_ambiguous_rows_ask_instead_of_guessing` 挂在「我的参考文献格式不对」那行 → **是测试太严，不是数据错**。`expect: citation_format` + `expect_clarify: true` 编码的是「意图已知、槽位缺失」，这是第二种合法的歧义模式。放宽测试，并另加一条测试**要求两种模式都必须存在**。
+      - `test_every_boundary_case_explains_itself` 挂在「在吗 / 你是谁开发的 / 今天天气怎么样」→ **这次是数据错**，故意不放宽测试，给三行补上 `note`。边界用例不写理由，三个月后没人知道它为什么在那儿。
+    → **撤回一个我自己编的坑**：我一度断言「空字符串 `SecretStr('')` 是 truthy，会让 Langfuse/Jev 被静默启用」，还准备写 validator。**实测是错的** —— `bool(SecretStr(''))` 就是 `False`。没加那个 validator。教训：写防御代码前先跑一遍。
+
+---
+
+## 2026-10-14 · D2 · SSE 流式
+
+**做了什么**
+`/api/chat` 从 JSON 回显改成 SSE 流（`sse-starlette` 3.5.0），假生成器分片推送，不接 LLM。前端换成 Vercel AI SDK v7 的 `useChat` + **自写的 `SseChatTransport`**。浏览器实测通过：34 个网络分片、间隔约 40ms、连接持续 1379ms，Network 面板 `mimeType=text/event-stream`；停止按钮实测能真中断（分片数冻结在 79，`eof` 始终没到），且不报错。Python 101 passed / ruff 全绿 / `tsc --noEmit` 与 `eslint --max-warnings=0` 全绿。
+
+**定的协议（D3 会往上加事件）**
+
+```
+event: token   data: {"text": "..."}     一个文本增量
+event: done    data: {}                  正常结束（客户端把「没有 done」判为截断）
+event: error   data: {"message": "..."}  失败，之后不再有 done
+```
+
+**卡在哪 / 怎么解决**
+
+1. **★ 昨天给 D2 定的方案是错的：`TextStreamChatTransport` 根本不解析 SSE。**
+   → 装了 `ai@7.0.140` 之后去读 `.d.ts` 才发现：`TextStreamChatTransport.processResponseStream` 把响应体当 **`text/plain`** 直接切成 text delta，看见 `event:` 行只会当成正文。它跟验收标准里写的 `text/event-stream` 是互斥的两条路。
+   → `DefaultChatTransport` 能解析，但要求 **Python 端吐 AI SDK 内部的 `UIMessageChunk` 格式**——那是个 TS 包的私有协议，跨版本会变，而且网关根本不该依赖它。
+   → **最终方案：自定义 transport。** `HttpChatTransport` 是抽象类且**运行时有导出**（`typeof ai.HttpChatTransport === 'function'`，先验过再动手），只需实现 `processResponseStream` 一个方法，请求构造 / abort / headers / 非 2xx 全部继承。协议知识只存在于一个有类型检查的 TS 文件里，Python 端保持稳定简单的自有协议。**这个「网关不学前端 SDK 的私有格式」的边界，面试时是个能讲的点。**
+
+2. **`useChat` 不在 `ai` 包里，在 `@ai-sdk/react`。**
+   → `ai` 的根导出里没有 `useChat`（只在注释里出现）。要单独装 `@ai-sdk/react`。
+   → 版本号看着像装错了：`@ai-sdk/react@4.0.143` 对 `ai@7.0.140`。**查了 `dependencies` 才放心**——它精确依赖 `ai: 7.0.140`，两个包只是各自独立编号。别看到数字差很大就以为版本冲突。
+
+3. **★ Next 16 的 `cacheComponents` 把 `useChat` 判成构建错误。**
+   → 报错：`Next.js encountered the unstable value Math.random() in a Client Component`，指向 `useChat(...)` 那一行。根因是我传了 `id: threadId || undefined`，SSR 阶段 `threadId` 是空串 → `undefined` → **useChat 内部用 `Math.random()` 自己造 id**，而 `cacheComponents: true` 禁止在预渲染里出现不稳定值。
+   → 按官方给的 `[stream]` 方案修：在 `page.tsx` 用 `<Suspense fallback={骨架}>` 包住 `ChatPanel`。这样它变成**每请求动态渲染**而不是被冻进静态 HTML，`Math.random()` 就合法了。骨架屏顺带成了真的 loading 态。
+   → **`apps/web/agents.md` 早就警告过「This is NOT the Next.js you know，写代码前先读 `node_modules/next/dist/docs/`」。这次算是验证了它没开玩笑。**
+
+4. **React 19 的两条新 lint 规则，各逼我改了一次设计。**
+   → `react-hooks/refs`：我原本写 `uiContextRef.current = uiContext` 在渲染期同步 ref，好让只建一次的 transport 能读到最新 `ui_context`。**报错：渲染期间不能写 ref。**
+     正解不是塞进 `useEffect`（那会慢一帧），而是**根本不用 ref**：`ChatRequestOptions` 有 `body` 字段，`sendMessage({text}, { body: { ui_context } })` 逐请求带上，读的就是点击那一刻的状态。更简单也更准。
+   → `react-hooks/set-state-in-effect`：`useEffect(() => setMounted(true), [])` 这个老套路被判违规（同步 setState 触发级联渲染）。
+     正解是 **`useSyncExternalStore(subscribe, getThreadId, () => "")`**：SSR 和 hydration 都用服务端快照 `""`，之后 React 自己拿客户端值重渲染，**天然没有 hydration mismatch**，`mounted` 标志整个删掉。读 localStorage 这类「外部可变存储」本来就该用它。
+
+5. **`id` → `thread_id` 的别名，是给 D7 留的缝。**
+   → SDK 管会话 id 叫 `id`，LangGraph 的 checkpointer 要的键叫 `thread_id`。在 `ChatRequest` 上直接 `Field(alias="id")` + `populate_by_name`，**D7 接 checkpointer 时那一行 diff 是零**。
+   → 顺便验了一件容易错的事：`useChat` 的内部 `Chat` 实例是 `useMemo(..., [options.id])`，所以 hydration 后 id 从 `""` 变成真 UUID 会**重建一次**。安全，因为那发生在任何消息存在之前。这是读源码确认的，不是猜的。
+
+6. **传输层两个必须显式处理的细节。**
+   → **`ensure_ascii=False`**：`json.dumps` 默认把中文转成 `\uXXXX`，字节数翻三倍，DevTools 里还全是转义看不懂。已加测试钉住（`b"\\u" not in r.content`）。
+   → **按码点切片，不按字节**：`reply[start:start+4]` 切的是 Python str 的码点，所以多字节汉字永远不会被拦腰截断。前端另外用 `TextDecoder(..., {stream:true})` 兜住「一个 UTF-8 字符跨两个 HTTP 分片」的情况——两层各管一件事。
+   → **SSE 分隔符是 `\r\n` 不是 `\n`**（`sse-starlette` 的 `DEFAULT_SEPARATOR`）。解析器按规范同时容忍 `\r\n\r\n` / `\n\n` / `\r\r`，跳过 `:` 开头的注释行（**15s keepalive ping 就是走注释行**），多行 `data:` 用 `\n` 拼接，冒号后只剥一个空格。Python 测试里**故意独立重写了一份解析器**而不共用代码：两边对同一串字节达成一致，才说明协议是真定义清楚了。
+
+7. **★ 浏览器里的计时测试不可信，踩了三次才想明白。**
+   → 现象：想用 `setInterval(50ms)` 采样 DOM 证明「逐字出现」，4 秒只采到 6 个点；想用 `setTimeout(420ms)` 点停止按钮，结果按钮还没出现（`chunksAtStop: 0`）。
+   → 根因两条叠加：**后台标签页的定时器会被节流到 ~1s**，以及 **MCP 单次调用本身有约 10s 延迟**——我 3000 字的流要跑 34s，可两次 MCP 调用之间就已经过去了。
+   → 正解：**别用页面定时器测，改成在网络层插桩。** 包一层 `window.fetch`，把 `res.body.tee()` 的一路拿来记录每个分片的到达时刻。这拿到的是硬证据：34 个分片、间隔 0/38/79/120…ms、总跨度 1379ms。
+   → 要测「流中途」的行为，就**把整段编排塞进一次 `evaluate_script`**（提交 + 3s 后点停止 + 6s 后复查，结果存到 `window.__ab`），再单独一次调用把结果读回来。跨 MCP 调用的时序一律不要指望。
+   → 后端时序另外用 `httpx.stream` 独立测了一遍做对照：17 个 token 事件、平均间隔 **43.3ms**，和配置的 `CHUNK_DELAY=0.04` 对得上。**浏览器测出来的数要和后端直接测的数互相印证。**
+
+8. **abort 路径本来藏着一个我猜错的坑，实测才发现没事。**
+   → 我担心：用户点停止 → 流被取消 → 我的 transport 收不到 `done` → `flush` 里那句「没有 done 就是截断」会误报错误。
+   → 实测 `errBanner: false`，**没有误报**。原因：取消一个 `TransformStream` 管道走的是 cancel 路径，**`flush` 只在 writable 端正常 close 时才调用**，所以那句兜底不会触发。分片数冻在 79、`eof` 始终未到、状态回到 `ready`、按钮翻回「发送」，全部正确。
+   → 教训：这种「我以为会 bug」的地方，**要么测掉，要么别写**。这次是先写了兜底再测，运气好是对的；下次可能就不是。
+
+9. **测试套件的一个设计取舍：把假生成器的节奏做成模块常量。**
+   → `CHUNK_SIZE` / `CHUNK_DELAY` 提到模块级，测试里用一个 autouse fixture 把 `CHUNK_DELAY` 打成 0。否则每条流式测试都要真等 1 秒多，套件会从 0.9s 涨到 10s+。**节奏是给浏览器演示用的装饰，协议本身不依赖它**，所以可以安全地在测试里关掉。
+   → 最有价值的一条测试是 `test_chat_stream_is_chunked_not_buffered`（断言 token 事件数 > 1）。如果哪天生成器被不小心收集成一整个响应，**其余测试全都会照常通过**——文字照样对、`done` 照样在——只有这条会发现「流」退化成了「一次性返回」。
+
+**明天的事（D3 · LangGraph + 真 LLM）**
+- `uv add langchain-openai langfuse`（**先停 uvicorn**，见 D1 坑 7），把假生成器换成真实 agent 流
+- 接 DeepSeek：`deepseek-flash` 走 Fast Path，`max_tokens` 别小于 2048（见 D1 坑 12 的 `reasoning_content` 陷阱）
+- 协议加事件：`route`（意图判定结果）/ `tool`（工具调用起止）/ `citation`。前端 transport 已经**忽略未知事件名**，所以后端可以先加、前端后接
+- Langfuse key 还没申请，trace 先空着
+
+---
+
+## 2026-10-14 · 计划外 · vendor 第三方 skill 并处理许可
+
+用户提出用 [Nature Skills](https://github.com/Yuan1z0825/nature-skills) 做主要科研能力。核实后判定**可以用**，且这次不是 pi / Hermes 那类错误：**skill 是知识，不是架构**。不从零重写 Nature 风格指南和统计报告规范是称职的选择；必须自研的是路由、grounding、评测——skill 包替代不了这三件事。
+
+上游 23 个 skill，vendor 6 个（`nature-shared` / `nature-polishing` / `nature-statistics` / `nature-social-science` / `nature-ref-verifier` / `nature-response`），996 KB / 123 文件，落在 `skills/third_party/`，配 `LICENSE` + `NOTICE` + `PROVENANCE.md`。
+
+**意外收获（比 vendor 本身更值钱）**
+
+1. **`nature-statistics` 直接顶替了我们原计划手写的 `statistics-reporting` skill。** 而且它的 README 明写覆盖「**跨章节数值一致性**」——这就是同一天我刚提议的第三个 KPI「数字保真度」，上游已经实现了。
+2. **`nature-shared/scripts/check_consistency.py`（272 行）是数字保真度的现成参考实现**：纯 stdlib（`Decimal` / `re` / `dataclasses` / `argparse`），术语组一致性 + 单位换算（um/mm/cm/m）+ 数值一致性，输出结构化 `Finding` 与 JSON。**零 LLM 调用、零 token 成本**——在 DeepSeek 余额只剩 ¥3.14 的情况下这点很实际。
+3. **`nature-ref-verifier`（Stable）是 Citation Precision 的现成机械层**：逐条多源交叉验证，逐字段比对作者/标题/年份/卷期/页码，标记卷年冲突、**作者编造**、页码漂移。
+4. **D5 的阻塞被解掉了。** 上游 README 确认 CrossRef / arXiv **不需要 API key**，PubMed 只要一个联系邮箱（`NCBI_API_KEY` 仅用于提速率）。**不必再等 Semantic Scholar 的 key。**
+5. **`nature-social-science`（277 KB，零代码）正中「提供思路」**，而且受众对得上：明确覆盖「找论文题目/研究问题」「区分『研究少』与真正未决的知识问题」「开题报告、学位论文的选题阶段与论证自检」。
+
+**坑 / 判断**
+
+6. **★ `extend-exclude` 挡不住显式传路径。** 根 `pyproject.toml` 原本只有 `extend-exclude = ["docs"]`；加上 `skills/third_party` 之后，`ruff format .` 确实跳过了它——但 `ruff format skills/third_party/` **照样报「3 files would be reformatted」**，`ruff check` 找到 12 个错误并声称 8 个可 `--fix`。编辑器的 format-on-save、pre-commit hook、任何传显式路径的 CI 都会绕过排除。
+   → 修法是 `[tool.ruff] force-exclude = true`。加完实测：显式传 vendored 路径变成「No Python files found」，而显式传我们自己的文件照常检查。
+   → **为什么这条要命**：`NOTICE` 里声明这些是 verbatim copies。`ruff format` 改一个空格就让这句声明变成假的，并触发 Apache-2.0 §4(b)「修改过的文件必须显著声明改动」的义务——而我们根本没打算改。两个配置项都写了测试守着。
+7. **★ 上游用 `../nature-shared/core/*.md` 相对路径引用共享材料，共 12 条。** 只在六个目录**互为兄弟**时才成立。目录结构一变深，失败发生在 **prompt 组装期而不是 import 期**——不报错，只表现为输出质量下降。上游 README 也明写「请复制或引用整个技能文件夹，而不是只复制 `SKILL.md`」。
+8. **安全审查用「已审查文件白名单」而不是「危险模式黑名单」。** 5 个 `.py` 全读过：纯 stdlib，无网络 / `subprocess` / `eval` / `exec` / 环境变量读取。黑名单扫描只能证明「我认识的危险模式没出现」；白名单能证明「这里没有我不认识的文件」。测试里两个都做了，白名单是主门禁。
+   → 四条门禁全部做过**反向验证**（新增未审查 `.py` / 已审查文件混入 `import requests` / 改名共享文件制造悬空引用 / 混入 `install.sh`），确认每条都真的会 fail。**一个从不失败的测试等于没有测试。**
+9. **`nature-academic-search/install.sh` 是「第三方 skill = 任意代码执行」的教科书标本**，留档在 PROVENANCE.md，永不执行：不 pin 版本 `pip install mcp requests toml lxml`；自动改写 `~/.claude/.mcp.json` 并把自己塞进 `settings.json` 的 `enabledMcpjsonServers`（**静默自我启用，用户全程没批准过任何事**）；`PUBMED_EMAIL` 从 shell 参数直插 Python heredoc 与生成的 JSON；工具表含 `search_google_scholar`（上游自述 **scraped**）与需机构订阅的 Scopus / WoS。
+   → 对比 pi 的供应链姿态（exact pin / `min-release-age=2` / `--ignore-scripts` / lifecycle-script allowlist），差距一目了然。这段可以直接进安全博客。
+10. **`nature-downloader` 明确排除**：上游描述是「通过图书馆资源入口、**Chrome 登录态**和开放获取路径合法获取学术全文/PDF」，触发词含 CARSI、Web of Science。借用用户已认证的机构会话批量取付费全文，产品化在法律与伦理上都不可接受。它还是 MIT 的第三方贡献（`Copyright (c) 2026 baihe26`），会连带继承责任。
+11. **不 vendor 第二个 router。** 本机 `~/.qoder/skills/` 里有个 `nature-suite`，正文就是一张关键词 → 子 skill 映射表，还写着「This skill loads first and routes」。**它与自研的 L0→Jev→embedding→LLM 四级意图级联正面冲突**，把路由换成 markdown 关键词表等于自杀。
+    → 但它那张表列了 9 类意图 + 中英关键词，**正好是 `routing.jsonl` 从 24 条扩到 100 条的种子语料**。抄分类，不抄机制。
+12. **本机安装副本 ≠ 上游仓库，且本机副本无 LICENSE。** 本机有 `nature-academic-search` / `nature-citation` / `nature-data` / `nature-suite`，仓库 skill 索引里没有或不同；本机顶层没有 LICENSE 文件。**来源与授权均不明，所以一个文件都没从本机拿**，全部来自 pin 住的 GitHub commit `19be8d4`。
+    → 顺带：仓库内许可是**混合**的——根 Apache-2.0，但 `nature-downloader` / `nature-image2ppt` 各带自己的 MIT LICENSE，`nature-proposal-writer` / `nature-literature-pipeline` 在 frontmatter 里声明 `license: MIT`。我们 vendor 的 6 个都**没有**单独 license 字段，所以统一由根 Apache-2.0 覆盖，无混合授权问题。有一条测试专门守这个前提。
+13. **Apache-2.0 的署名占位符是空的**：上游 LICENSE 结尾是模板原文 `Copyright [yyyy] [name of copyright owner]`，没填。所以版权归属只能从 README 开发者表取（**袁一哲** 创始人/维护者、**马昕瑞** 核心开发者）+ git 提交者（`老农民玩AI <mhoang12205@gmail.com>`），已写进 `NOTICE`。上游也没有 NOTICE 文件，我们自己建了一份。
+    → 唯一一处需按 §4(c) 保留的文件内署名：`nature-social-science/SKILL.md` frontmatter 的 `author: community contribution, adapted from the "Finding a PhD Topic with Codex" workflow`。
+14. **成熟度标签是上游自己标的，要当真**：`nature-polishing` / `nature-ref-verifier` = Stable，`nature-response` = Beta，**`nature-statistics` / `nature-social-science` = Draft**。后两个恰好是「处理数据」和「提供思路」的主力。
+    → 这既是风险也是机会：把上游 Draft 级 skill 补到能用、并把改动记进 PROVENANCE.md 的修改日志，是一个真实可讲的贡献故事，比「我调了个 API」强。
+15. **上游 README 声称 DeepMind 借鉴了它并推出 Science Skills**（第 105 行）。**未经核实，是作者的自述。** 别在博客或面试里当事实转述。
+16. **git clone 到 github.com 会中途断流**：第一次 `--depth 1` 报 `fatal: fetch-pack: invalid index-pack output` + `unexpected disconnect while reading sideband packet`。加 `-c http.postBuffer=524288000 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60` 重试即成功。`raw.githubusercontent.com` 在这台机器上直接返回 000，但 `api.github.com` 通。
+17. **`skills/third_party/*/tests/` 不在 `testpaths` 里，是刻意的**：那是上游的测试，收进来等于把我们的套件耦合到不自维护的代码上。写了一条测试守住这个配置，防止有人图省事把 `skills` 加进 `testpaths`。
+
+**当前门禁**：118 passed / 1 skipped / 1.0s；`ruff check` 全绿；`ruff format --check` 21 files already formatted。vendored 树经 `diff -r` 逐字节比对确认与上游 `19be8d4` 一致——所以 `NOTICE` 里那句 verbatim 是**验证过的**，不是声明。
+
+---
+
+- [x] ~~装 Docker Desktop~~ → **不需要了**，存储已本地化；Docker 留给 Week 4 部署
+- [x] ~~申请 Semantic Scholar API key（无 key 配额低到没法开发）~~ → **D5 不再被它阻塞**：上游 `nature-academic-search` 已确认 CrossRef / arXiv **无需 key**，PubMed 只要联系邮箱。Semantic Scholar 降级为「有了更好」（它提供引用图谱与 field-of-study 过滤）。
+- [ ] 申请 TypeSafe AI key（D4）
+- [ ] 注册 Langfuse Cloud（D3）
+- [ ] routing.jsonl 目前 24 条，D7 要凑满 100 条 —— **每天随手追加，别攒到最后编**（现在少于 100 会显示成一条 pytest skip，不是红 CI）。**种子语料已找到**：本机 `nature-suite/SKILL.md` 的关键词表列了 9 类意图 + 中英触发词，抄分类不抄机制。
+- [ ] **skill loader 必须保持 `skills/third_party/` 下六个目录互为兄弟**，否则 12 条 `../nature-shared/*.md` 引用会在 prompt 组装期静默失效（不报错，只掉质量）。D6 实现 loader 时这是硬约束。
+- [ ] **`nature-statistics` 与 `nature-social-science` 是上游 Draft 级**，却分别是「处理数据」和「提供思路」的主力。要用就得补，改动逐条记进 `skills/third_party/PROVENANCE.md` 的修改日志（Apache-2.0 §4(b)）。
+- [ ] 数字保真度 KPI：`nature-shared/scripts/check_consistency.py`（272 行纯 stdlib）是现成参考实现，Verifier 节点可以直接借鉴其 `Finding` 结构，**零 LLM 成本**。
+- [x] ~~整个仓库零测试~~ → **D1 收尾补齐：101 passed / 1 skipped，0.9s**。四个测试文件覆盖 storage / config / API 契约 / routing 数据，并当场抓到 `Path("..").name == ".."` 那个真 bug（见坑 13）。
+- [ ] `apps/web/agents.md` 是 `next dev` 自动生成并会自己加回来的，**别当成自己的改动删掉**（删了只会变成未提交改动，提交了反而脏）。
+- [ ] **D3 之前先给 SSE 协议加事件**：`route` / `tool` / `citation`。前端 transport 已忽略未知事件名，后端可以先加。
+- [x] ~~**Week 3 前要决定向量检索走哪条路**~~ → **已定：本地全 SQLite**（`sqlite-vec` + FTS5 `bm25()` + RRF），部署时换 pgvector。见坑 11。
+- [x] ~~`.env` 已从 example 生成，API key 还是空的~~ → **DeepSeek key 已接入并实测通过**（见坑 12）。`CHECKPOINT_BACKEND=sqlite`。
+- [ ] **DeepSeek 余额只剩 ¥3.14（2026-10-14 实测）**。日常开发够用（flash 档单次工具调用约 500 token），但 Week 4 的评测套件（100 条 routing × 多轮 + grounding 逐 claim 蕴含校验）会很紧张，**跑评测前先充值**。
+- [ ] **轮换 DeepSeek key**：这个 key 在聊天里明文发过一次，已落进本地 transcript。`.env` 里那份能用，但建议到控制台重签一个。
+- [ ] Langfuse / TypeSafe(Jev) / Semantic Scholar 三个 key 仍为空，分别卡在 D3 / D4 / D5。
