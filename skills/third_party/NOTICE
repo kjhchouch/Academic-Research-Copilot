@@ -1,0 +1,57 @@
+Nature Skills — vendored subset
+===============================
+
+This directory contains a subset of the "Nature Skills" project, redistributed
+under the Apache License, Version 2.0. The full license text is in the
+LICENSE file alongside this notice.
+
+Upstream work
+-------------
+Project    : Nature Skills (符合 nature 论文学术表达和科研绘图的 Skill)
+Repository : https://github.com/Yuan1z0825/nature-skills
+Commit     : 19be8d45e0d5233aa44be6d4572e655b9914ff54
+Retrieved  : 2026-10-14
+License    : Apache-2.0 (repository root LICENSE)
+
+Copyright holders / authors
+---------------------------
+Copyright 2026 袁一哲 (Yuan Yizhe) — founder and maintainer
+Copyright 2026 马昕瑞 (Ma Xinrui) — core developer
+Git committer of record: 老农民玩AI <mhoang12205@gmail.com>
+
+Individual skills carry no separate `license:` field in their SKILL.md
+frontmatter, so all six vendored skills are covered by the repository-root
+Apache-2.0 grant. Two skills elsewhere in the upstream repository
+(`nature-downloader`, `nature-image2ppt`) are MIT-licensed third-party
+contributions with their own LICENSE files; neither is vendored here.
+
+Attribution preserved from upstream
+-----------------------------------
+nature-social-science/SKILL.md, frontmatter `author`:
+  "community contribution, adapted from the 'Finding a PhD Topic with Codex'
+   workflow"
+
+Vendored skills
+---------------
+nature-shared          shared reference package (dependency of the others;
+                       not a user-facing workflow)
+nature-polishing       Stable
+nature-ref-verifier    Stable
+nature-response        Beta
+nature-statistics      Draft
+nature-social-science  Draft
+
+Maturity labels are upstream's own, taken from the repository README skill
+index at the pinned commit.
+
+Modifications
+-------------
+As of the commit recorded above, the files in this directory are VERBATIM
+copies of upstream. No skill content has been modified.
+
+Apache-2.0 §4(b) requires that modified files carry prominent notices stating
+that they were changed. Any future modification to a vendored file MUST be
+recorded in PROVENANCE.md, in the "Modification log" section, with the file
+path, the date, and a description of the change.
+
+What was deliberately NOT vendored, and why, is documented in PROVENANCE.md.
