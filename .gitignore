@@ -1,0 +1,57 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.python-version.local
+uv.lock.bak
+
+# --- Node / Next.js ---
+node_modules/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+next-env.d.ts
+
+# --- Env & secrets (NEVER commit .env) ---
+.env
+.env.*
+!.env.example
+
+# --- Data & artifacts ---
+# Anchored on purpose. A bare `data/` matches at any depth and would silently
+# swallow packages/evals/data/routing.jsonl -- the eval dataset is source, not
+# an artifact. Only these two are runtime output.
+/data/
+/apps/api/data/
+*.sqlite
+*.sqlite3
+*.db
+storage/
+uploads/
+
+# --- Test / coverage ---
+.pytest_cache/
+.coverage
+htmlcov/
+coverage/
+
+# --- Observability local cache ---
+.langfuse-cache/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# --- Demo recordings (large; keep out of git, store in releases) ---
+docs/*.mp4
+docs/*.mov

@@ -1,0 +1,51 @@
+[project]
+name = "paper-agent-root"
+version = "0.1.0"
+description = "Academic Research Copilot — monorepo root (virtual workspace)"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+# Root is a virtual project: it exists only to define the workspace.
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = [
+    "apps/api",
+    "packages/agent",
+    "packages/evals",
+    "packages/mcp-servers/*",
+]
+
+# ---------------------------------------------------------------------------
+# Python is pinned to 3.12 via .python-version.
+# Reason: the system interpreter here is 3.14, and the LangGraph / langchain
+# ecosystem does not yet publish wheels for it. `uv` will download 3.12 itself.
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["apps", "packages"]
+# Ruff >=0.17 also formats Python fences inside Markdown. The code samples in
+# docs/ are teaching material with deliberate comment alignment — leave them alone.
+#
+# skills/third_party is vendored Apache-2.0 code that NOTICE declares to be a
+# verbatim copy. Letting `ruff format` touch it would silently make that claim
+# false and trigger the §4(b) "state your changes" obligation for reformatting
+# we never intended. The integrity tests in packages/agent/tests/
+# test_vendored_skills.py are the gate for that tree, not ruff.
+extend-exclude = ["docs", "skills/third_party"]
+# Without this, `extend-exclude` only applies while ruff walks the tree from its
+# start point. Passing a path explicitly -- editor format-on-save, a pre-commit
+# hook, `ruff format skills/` -- bypasses the exclusion entirely and rewrites the
+# vendored files. force-exclude makes the exclusion unconditional.
+force-exclude = true
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["packages/agent", "packages/evals", "apps/api"]
+asyncio_mode = "auto"

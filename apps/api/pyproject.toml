@@ -1,0 +1,36 @@
+[project]
+name = "api"
+version = "0.1.0"
+description = "FastAPI gateway: SSE streaming, auth, rate limiting"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    # Brings langgraph + the sqlite checkpointer transitively. The gateway does
+    # not import them directly; it only calls paper_agent.storage.make_*.
+    "paper-agent",
+    "sse-starlette>=2.1",
+]
+
+# D3 adds: langchain-openai, langfuse
+# D7 adds: "psycopg[binary,pool]" (v3 — LangGraph's PostgresSaver needs psycopg, NOT psycopg2)
+
+[tool.uv.sources]
+paper-agent = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "httpx>=0.27",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/api"]
