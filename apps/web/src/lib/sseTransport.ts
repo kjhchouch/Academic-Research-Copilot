@@ -1,10 +1,11 @@
 /**
  * SSE transport for `useChat`.
  *
- * The gateway (apps/api) streams its own event vocabulary — `token` / `done` /
- * `error` — not the AI SDK's `UIMessageChunk` protocol. This class is the only
- * place that knows both, and because it is TypeScript the mapping is checked
- * against the installed SDK at compile time instead of silently drifting.
+ * The gateway (apps/api) streams its own event vocabulary — `token` / `tool` /
+ * `done` / `error` — not the AI SDK's `UIMessageChunk` protocol. This class is
+ * the only place that knows both, and because it is TypeScript the mapping is
+ * checked against the installed SDK at compile time instead of silently
+ * drifting.
  *
  * `TextStreamChatTransport` was the obvious candidate and does not work here:
  * it decodes a `text/plain` body straight into text deltas and has no idea what
@@ -21,6 +22,22 @@ import type { UIMessage, UIMessageChunk } from "ai";
 
 /** One parsed SSE event. `data` is the joined multi-line data field. */
 type SseEvent = { event: string; data: string };
+
+/**
+ * Payload of the gateway's `tool` event.
+ *
+ * `result` is a JSON value, not a JSON string: LangChain stringifies whatever a
+ * tool returns, and the gateway parses it back out so this side does not have to
+ * double-decode. It can still be a plain string when the tool returned prose, so
+ * the UI renders it defensively.
+ */
+type ToolEvent = {
+  status: "start" | "end";
+  name?: string | null;
+  id?: string | null;
+  args?: unknown;
+  result?: unknown;
+};
 
 /**
  * Split a raw event block into fields, per the SSE spec.
@@ -63,6 +80,7 @@ export class SseChatTransport extends HttpChatTransport<UIMessage> {
     const decoder = new TextDecoder();
     let buffer = "";
     let textId: string | null = null;
+    let textSeq = 0;
     let sawDone = false;
     let sawError = false;
 
@@ -100,10 +118,49 @@ export class SseChatTransport extends HttpChatTransport<UIMessage> {
                   const { text: delta } = JSON.parse(parsed.data) as { text?: string };
                   if (!delta) break;
                   if (textId === null) {
-                    textId = "sse-text-0";
+                    // A fresh id per segment: a tool call closes the current text
+                    // part, and reusing the id would collide with the part the
+                    // SDK has already committed to the message.
+                    textId = `sse-text-${textSeq++}`;
                     controller.enqueue({ type: "text-start", id: textId });
                   }
                   controller.enqueue({ type: "text-delta", id: textId, delta });
+                  break;
+                }
+                case "tool": {
+                  const evt = JSON.parse(parsed.data) as ToolEvent;
+                  if (!evt.id) break;
+                  const toolName = evt.name ?? "tool";
+                  // Close the open text part first. ReAct interleaves prose and
+                  // tool calls, and a tool part landing inside an unfinished text
+                  // part is what makes the SDK's part ordering unpredictable.
+                  if (textId !== null) {
+                    controller.enqueue({ type: "text-end", id: textId });
+                    textId = null;
+                  }
+                  if (evt.status === "start") {
+                    controller.enqueue({
+                      type: "tool-input-start",
+                      toolCallId: evt.id,
+                      toolName,
+                    });
+                    // The gateway sends args whole rather than as input deltas,
+                    // so `input-available` follows immediately. Without it the
+                    // part stays in `input-streaming` forever and the UI has no
+                    // way to show what the tool was asked to do.
+                    controller.enqueue({
+                      type: "tool-input-available",
+                      toolCallId: evt.id,
+                      toolName,
+                      input: evt.args,
+                    });
+                  } else {
+                    controller.enqueue({
+                      type: "tool-output-available",
+                      toolCallId: evt.id,
+                      output: evt.result,
+                    });
+                  }
                   break;
                 }
                 case "done":
@@ -119,8 +176,8 @@ export class SseChatTransport extends HttpChatTransport<UIMessage> {
                   break;
                 }
                 default:
-                  // D3 adds route/tool/citation events. Ignoring unknown names
-                  // means an older frontend survives a newer gateway.
+                  // D4 adds `route`; Week 2 adds `citation`. Ignoring unknown
+                  // names means an older frontend survives a newer gateway.
                   break;
               }
             }

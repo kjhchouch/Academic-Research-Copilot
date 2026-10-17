@@ -10,9 +10,20 @@ dependencies = [
     # because the workspace venv happens to install the union.
     "langgraph>=1.2.15",
     "langgraph-checkpoint-sqlite>=3.1.2",
+    # AsyncSqliteSaver's driver. It was already importable transitively, so
+    # declaring it is what turns "happens to work in this venv" into a guarantee.
+    "aiosqlite>=0.22",
+    "langchain-openai>=1.7.2",
+    # >=5, not >=3: observability.py calls CallbackHandler() with no credentials,
+    # which is the v5 signature. The v3 handler took public_key/secret_key/host
+    # directly, so a v3 install would fail on an unexpected keyword argument --
+    # loudly, at least, rather than silently tracing nothing.
+    "langfuse>=5",
 ]
 
-# D3 adds: langgraph-checkpoint-postgres, langchain-openai, langfuse
+# langgraph-checkpoint-postgres deliberately NOT added: retrieval and
+# checkpointing both settled on SQLite (see README "开发计划" and devlog 坑 11).
+# Add it in Week 4 if deployment actually needs Postgres.
 # D4 adds: typesafe-sdk
 # D5 adds: mcp[cli]
 

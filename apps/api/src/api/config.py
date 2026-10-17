@@ -56,6 +56,12 @@ class Settings(BaseSettings):
     # budget. Set it too low and the model spends everything reasoning and never
     # emits the tool call -- reads like broken tool calling, is actually this.
     llm_max_tokens: int = 2048
+    # Low, not zero. Temperature 0 does not make output reproducible anyway --
+    # MoE routing, batch composition and float accumulation order all vary -- so
+    # the honest goal is a stable distribution, not a fixed string. What 0 would
+    # buy is degenerate repetition on long generations, which is worse than the
+    # variance it removes.
+    llm_temperature: float = 0.2
 
     langfuse_public_key: str | None = None
     langfuse_secret_key: SecretStr | None = None

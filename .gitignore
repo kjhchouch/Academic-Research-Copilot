@@ -55,3 +55,10 @@ Thumbs.db
 # --- Demo recordings (large; keep out of git, store in releases) ---
 docs/*.mp4
 docs/*.mov
+
+# --- Local scratch ---
+# One-off build scripts and their PDF output (talk decks, resume renders). Not
+# part of the product, and it holds personal documents that must never reach a
+# public repo. Ignoring it also keeps `ruff check .` off 60k lines of generated
+# layout code, which respects .gitignore by default.
+/talk/

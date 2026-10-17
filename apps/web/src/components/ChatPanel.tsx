@@ -2,15 +2,43 @@
 
 import { useChat } from "@ai-sdk/react";
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
-import type { UIMessage } from "ai";
+import type { DynamicToolUIPart } from "ai";
 import { API_BASE, CHAT_ENDPOINT, getThreadId, type UiContext } from "@/lib/api";
 import { SseChatTransport } from "@/lib/sseTransport";
 
 const PANELS = ["chat", "editor", "outline", "references"] as const;
 
-/** Text parts only, for now. D3 adds tool-call and citation parts to render. */
-function messageText(message: UIMessage): string {
-  return message.parts.map((part) => (part.type === "text" ? part.text : "")).join("");
+/** Display names for the gateway's built-in tools. Unknown tools fall back to
+ *  the raw name, so a new backend tool shows up without a frontend deploy. */
+const TOOL_LABELS: Record<string, string> = {
+  count_words: "统计字数",
+};
+
+function summarize(output: unknown): string {
+  if (output == null) return "";
+  const text = typeof output === "string" ? output : JSON.stringify(output);
+  return text.length > 60 ? `${text.slice(0, 60)}…` : text;
+}
+
+/**
+ * One tool call, rendered inline where it happened in the reply.
+ *
+ * Not decoration: a ReAct agent that calls a tool and then answers leaves the
+ * user staring at a pause with no explanation. Showing the call is also the
+ * honest half of "辅助不代写" — the numbers in the reply are visibly derived
+ * from a tool the user can inspect, not invented by the model.
+ */
+function ToolChip({ part }: { part: DynamicToolUIPart }) {
+  const finished = part.state === "output-available" || part.state === "output-error";
+  return (
+    <div className="my-1.5 flex items-center gap-2 rounded border border-zinc-800 bg-zinc-950/60 px-2.5 py-1 font-mono text-[11px]">
+      <span className={finished ? "text-emerald-400" : "animate-pulse text-zinc-300"}>
+        {part.state === "output-error" ? "✕" : finished ? "✓" : "●"}
+      </span>
+      <span className="text-zinc-300">{TOOL_LABELS[part.toolName] ?? part.toolName}</span>
+      {finished && <span className="truncate text-zinc-500">{summarize(part.output)}</span>}
+    </div>
+  );
 }
 
 // The thread id never changes within a session, so there is nothing to
@@ -121,7 +149,7 @@ export default function ChatPanel() {
       <div className="flex-1 space-y-4 overflow-y-auto px-5 py-6">
         {messages.length === 0 && (
           <p className="mx-auto max-w-md text-center text-sm text-zinc-500">
-            D2 流式骨架：后端逐块推送 SSE，这里逐字渲染。D3 接 LangGraph，D6 接真实文献检索。
+            D3：后端是 LangGraph ReAct 图，工具调用会显示在回答里。D4 接意图路由，D6 接真实文献检索。
           </p>
         )}
         {messages.map((m) => (
@@ -136,7 +164,12 @@ export default function ChatPanel() {
                   : "border border-zinc-800 bg-zinc-900 text-zinc-200"
               }`}
             >
-              {messageText(m)}
+              {m.parts.map((part, i) => {
+                if (part.type === "text") return <span key={i}>{part.text}</span>;
+                if (part.type === "dynamic-tool")
+                  return <ToolChip key={`${part.toolCallId}-${i}`} part={part} />;
+                return null;
+              })}
               {/* Caret only on the message currently being streamed. */}
               {m.role === "assistant" &&
                 m.id === messages[messages.length - 1]?.id &&
@@ -167,7 +200,7 @@ export default function ChatPanel() {
           <input
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder="问点什么…（D2 会把回显逐字流回来）"
+            placeholder="问点什么…（试试「数一下这段有多少字」）"
             disabled={busy}
             className="flex-1 rounded-lg border border-zinc-700 bg-zinc-900 px-3.5 py-2.5 text-sm outline-none placeholder:text-zinc-600 focus:border-zinc-500 disabled:opacity-50"
           />

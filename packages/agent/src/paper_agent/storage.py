@@ -25,11 +25,17 @@ from typing import Any, Protocol
 # --------------------------------------------------------------------------- #
 
 
-def make_checkpointer(backend: str, sqlite_path: str, database_url: str) -> Any:
-    """Return a LangGraph checkpointer.
+async def make_checkpointer(backend: str, sqlite_path: str, database_url: str) -> Any:
+    """Return a LangGraph checkpointer matched to the app's execution model.
 
-    D3 uses `memory`; D7 switches to `sqlite` (or `postgres` once Docker or a
-    native Postgres with the right extensions is available).
+    Async, and the savers it returns are async too. The gateway drives the graph
+    with `astream` / `aget_state`; handing it the sync `SqliteSaver` boots fine
+    and then raises NotImplementedError on the first request, because that class
+    refuses to run a blocking sqlite3 call on the event loop. This was found by a
+    live run rather than by the test suite, which is exactly why the durability
+    tests below now go through `ainvoke` as well.
+
+    `memory` for tests, `sqlite` for local dev, `postgres` for deployment.
     """
     if backend == "memory":
         from langgraph.checkpoint.memory import InMemorySaver
@@ -37,23 +43,24 @@ def make_checkpointer(backend: str, sqlite_path: str, database_url: str) -> Any:
         return InMemorySaver()
 
     if backend == "sqlite":
-        # sync driver: no extra event-loop plumbing, fine for single-user dev.
-        from langgraph.checkpoint.sqlite import SqliteSaver
+        import aiosqlite
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
         Path(sqlite_path).parent.mkdir(parents=True, exist_ok=True)
-        import sqlite3
-
-        conn = sqlite3.connect(sqlite_path, check_same_thread=False)
-        return SqliteSaver(conn)
+        conn = await aiosqlite.connect(sqlite_path)
+        saver = AsyncSqliteSaver(conn)
+        await saver.setup()
+        return saver
 
     if backend == "postgres":
-        from langgraph.checkpoint.postgres import PostgresSaver
-
-        # PostgresSaver needs psycopg v3, NOT psycopg2.
-        cm = PostgresSaver.from_conn_string(database_url)
-        saver = cm.__enter__()
-        saver.setup()
-        return saver
+        # AsyncPostgresSaver, from langgraph-checkpoint-postgres, with psycopg v3
+        # (not psycopg2). Deliberately unimplemented rather than half-wired: the
+        # package is not a dependency yet, and a sync PostgresSaver here would
+        # reproduce the sqlite bug above on the first request in production.
+        raise NotImplementedError(
+            "CHECKPOINT_BACKEND=postgres needs langgraph-checkpoint-postgres and "
+            "AsyncPostgresSaver; it is a Week 4 deployment task. Use sqlite for now."
+        )
 
     raise ValueError(f"unknown CHECKPOINT_BACKEND: {backend!r}")
 

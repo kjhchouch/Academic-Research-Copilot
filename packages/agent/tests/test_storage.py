@@ -6,15 +6,23 @@ Three things this file exists to protect:
 * MemoryCache TTL/LRU semantics, which Jev result caching (D4) will rely on
 * the SQLite checkpointer really survives a process boundary — that is a Week 1
   exit criterion, so it belongs in CI rather than in a devlog note
+
+The checkpoint tests are async on purpose. The gateway drives the graph with
+`astream`, and a sync saver passed every one of these tests while raising
+NotImplementedError on the first real request; testing through `ainvoke` is what
+makes the suite exercise the path production actually takes.
 """
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, TypedDict
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
 from paper_agent.storage import (
     LocalBlobStore,
@@ -191,19 +199,28 @@ def test_make_cache_unknown_backend() -> None:
         make_cache("memcached", "")
 
 
-def test_make_checkpointer_memory() -> None:
-    assert isinstance(make_checkpointer("memory", "", ""), InMemorySaver)
+async def test_make_checkpointer_memory() -> None:
+    assert isinstance(await make_checkpointer("memory", "", ""), InMemorySaver)
 
 
-def test_make_checkpointer_unknown_backend() -> None:
+async def test_make_checkpointer_unknown_backend() -> None:
     with pytest.raises(ValueError, match="CHECKPOINT_BACKEND"):
-        make_checkpointer("mysql", "", "")
+        await make_checkpointer("mysql", "", "")
 
 
-def test_make_checkpointer_sqlite_creates_parent_dirs(tmp_path: Path) -> None:
+async def test_make_checkpointer_sqlite_creates_parent_dirs(tmp_path: Path) -> None:
     path = tmp_path / "nested" / "cp.sqlite"
-    make_checkpointer("sqlite", str(path), "")
+    async with _saver("sqlite", str(path)) as saver:
+        assert isinstance(saver, AsyncSqliteSaver)
     assert path.parent.is_dir()
+
+
+async def test_make_checkpointer_postgres_is_an_explicit_gap() -> None:
+    """Same shape as BLOB_BACKEND=s3: the production backend is a Week 4 task and
+    must fail with instructions, not with an ImportError from a package that was
+    never declared as a dependency."""
+    with pytest.raises(NotImplementedError, match="AsyncPostgresSaver"):
+        await make_checkpointer("postgres", "", "postgresql://localhost/agent")
 
 
 def test_make_blob_store_local(tmp_path: Path) -> None:
@@ -243,7 +260,29 @@ def _build(saver):
     return graph.compile(checkpointer=saver)
 
 
-def test_sqlite_checkpoint_survives_a_new_saver_instance(tmp_path: Path) -> None:
+@asynccontextmanager
+async def _saver(backend: str, path: str = "") -> AsyncIterator[Any]:
+    """A checkpointer whose connection is closed afterwards.
+
+    Mirrors the lifespan in apps/api. Without the close, every test leaves an
+    aiosqlite thread behind and the suite grows one thread per checkpoint test.
+    """
+    saver = await make_checkpointer(backend, path, "")
+    try:
+        yield saver
+    finally:
+        conn = getattr(saver, "conn", None)
+        if conn is not None:
+            await conn.close()
+
+
+@asynccontextmanager
+async def _graph(backend: str, path: str = "") -> AsyncIterator[Any]:
+    async with _saver(backend, path) as saver:
+        yield _build(saver)
+
+
+async def test_sqlite_checkpoint_survives_a_new_saver_instance(tmp_path: Path) -> None:
     """Restart the backend, conversation state is not lost.
 
     A second saver over the same file stands in for a restarted process. If this
@@ -253,38 +292,55 @@ def test_sqlite_checkpoint_survives_a_new_saver_instance(tmp_path: Path) -> None
     path = str(tmp_path / "cp.sqlite")
     config = {"configurable": {"thread_id": "t-roundtrip"}}
 
-    result = _build(make_checkpointer("sqlite", path, "")).invoke({"value": "ping"}, config)
+    async with _graph("sqlite", path) as app:
+        result = await app.ainvoke({"value": "ping"}, config)
     assert result["value"] == "pong"
 
-    snapshot = _build(make_checkpointer("sqlite", path, "")).get_state(config)
+    async with _graph("sqlite", path) as app:
+        snapshot = await app.aget_state(config)
     assert snapshot.values["value"] == "pong"
     assert not snapshot.next, "graph should have run to completion"
 
 
-def test_memory_checkpoint_does_not_survive_a_new_instance() -> None:
+async def test_memory_checkpoint_does_not_survive_a_new_instance() -> None:
     """The contrast case. Proves the test above is measuring durability and not
-    just that invoke() returned something."""
+    just that ainvoke() returned something."""
     config = {"configurable": {"thread_id": "t-memory"}}
-    _build(make_checkpointer("memory", "", "")).invoke({"value": "ping"}, config)
+    async with _graph("memory") as app:
+        await app.ainvoke({"value": "ping"}, config)
 
-    fresh = _build(make_checkpointer("memory", "", "")).get_state(config)
-    assert not fresh.values
+    async with _graph("memory") as app:
+        assert not (await app.aget_state(config)).values
 
 
-def test_threads_are_isolated(tmp_path: Path) -> None:
+async def test_threads_are_isolated(tmp_path: Path) -> None:
     """One SQLite file holds many conversations; thread_id is the only thing
     separating them. A leak here means users seeing each other's state."""
     path = str(tmp_path / "cp.sqlite")
-    _build(make_checkpointer("sqlite", path, "")).invoke(
-        {"value": "ping"}, {"configurable": {"thread_id": "a"}}
-    )
+    async with _graph("sqlite", path) as app:
+        await app.ainvoke({"value": "ping"}, {"configurable": {"thread_id": "a"}})
 
-    app = _build(make_checkpointer("sqlite", path, ""))
-    assert app.get_state({"configurable": {"thread_id": "a"}}).values["value"] == "pong"
-    assert not app.get_state({"configurable": {"thread_id": "b"}}).values
+    async with _graph("sqlite", path) as app:
+        a = await app.aget_state({"configurable": {"thread_id": "a"}})
+        b = await app.aget_state({"configurable": {"thread_id": "b"}})
+    assert a.values["value"] == "pong"
+    assert not b.values
 
 
-def test_unknown_thread_returns_empty_not_error(tmp_path: Path) -> None:
-    """A first message on a brand-new thread_id must not 500."""
-    app = _build(make_checkpointer("sqlite", str(tmp_path / "cp.sqlite"), ""))
-    assert not app.get_state({"configurable": {"thread_id": "never-seen"}}).values
+async def test_unknown_thread_returns_empty_not_error(tmp_path: Path) -> None:
+    """A first message on a brand-new thread_id must not 500. This is the read
+    the gateway makes before deciding whether to seed from client history."""
+    async with _graph("sqlite", str(tmp_path / "cp.sqlite")) as app:
+        snapshot = await app.aget_state({"configurable": {"thread_id": "never-seen"}})
+    assert not snapshot.values
+
+
+async def test_sqlite_saver_streams(tmp_path: Path) -> None:
+    """`astream` is the call the gateway actually makes, and it is the one that
+    raised NotImplementedError with the sync SqliteSaver — after startup, on the
+    first request, which is the worst possible time to find out.
+    """
+    config = {"configurable": {"thread_id": "t-stream"}}
+    async with _graph("sqlite", str(tmp_path / "cp.sqlite")) as app:
+        chunks = [c async for c in app.astream({"value": "ping"}, config)]
+    assert chunks == [{"echo": {"value": "pong"}}]
