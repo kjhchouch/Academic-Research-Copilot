@@ -67,7 +67,7 @@ graph TD
 |---|---|
 | 前端 | Next.js 16 · React 19 · TypeScript · Tailwind 4 · Vercel AI SDK |
 | 网关 | FastAPI · SSE |
-| 编排 | LangGraph 1.2 · SqliteSaver/PostgresSaver checkpoint · human-in-the-loop interrupt |
+| 编排 | LangGraph 1.2 · AsyncSqliteSaver checkpoint · human-in-the-loop interrupt |
 | 语言模型 | DeepSeek（OpenAI 兼容，改 `LLM_BASE_URL` 即可换 provider）· `deepseek-flash` 承接 Fast Path 与工具调用 · `deepseek-v4-pro` 承接 Deep Path 推理节点 |
 | 决策模型 | TypeSafe AI Jev（意图路由 / grounding 蕴含校验 / 注入检测） |
 | 检索 | 本地 `sqlite-vec` + FTS5 `bm25()` → 部署 pgvector HNSW + `tsvector` · RRF 融合 · cross-encoder rerank |
@@ -133,7 +133,9 @@ pnpm --dir apps/web dev
 
 ### 4.（可选）起基础设施
 
-只在把后端切到 `postgres` / `redis` / `s3` 时才需要，属于 **Week 4 部署**范畴：
+只在把后端切到 `postgres` / `redis` / `s3` 时才需要，属于 **Week 4 部署**范畴。
+
+> 注意 `CHECKPOINT_BACKEND=postgres` **现在会直接抛 `NotImplementedError`**，不是静默降级 —— 见下表脚注。`redis` / `s3` 则已可用。
 
 ```bash
 docker compose -f infra/docker-compose.yml up -d
@@ -149,11 +151,13 @@ docker compose -f infra/docker-compose.yml up -d
 
 | 用途 | 环境变量 | 本地默认 | 生产 |
 |---|---|---|---|
-| LangGraph checkpoint | `CHECKPOINT_BACKEND` | `sqlite` → `data/checkpoints.sqlite` | `postgres`（PostgresSaver） |
+| LangGraph checkpoint | `CHECKPOINT_BACKEND` | `sqlite` → `data/checkpoints.sqlite` | `postgres`（尚未接，见下） |
 | Jev 决策缓存 | `CACHE_BACKEND` | `memory`（LRU+TTL，单进程） | `redis` |
 | PDF / 附件 | `BLOB_BACKEND` | `local` → `data/blobs/` | `s3`（MinIO） |
 
 `memory` 也可用于 checkpoint，重启即丢，调试单次流程时更快。
+
+> **checkpoint 的 `postgres` 分支目前抛 `NotImplementedError`，是刻意的。** 网关全程用 `astream` / `aget_state`，而 `PostgresSaver` 和 `SqliteSaver` 一样只支持同步方法 —— 装上去能启动，然后在第一个请求上炸 `NotImplementedError: does not support async methods`，和本地 SQLite 踩过的完全是同一个坑（devlog D3 坑 2）。要接就得一起接 `AsyncPostgresSaver` + `langgraph-checkpoint-postgres`，那是 Week 4 的部署任务。提前抛错是为了让配置错误发生在启动时，而不是在用户的第一个请求上。
 
 **为什么这么设计**：Docker 是部署问题，不是开发前置条件。把 `docker compose up` 当成 Week 1 的必需品，会让本地开发平白多出一层摩擦。
 
@@ -258,6 +262,8 @@ CI 门禁：修改任何 `SKILL.md` 的 frontmatter 或路由 prompt，必须跑
 - 学术诚信边界在路由层强制：整篇代写、降重类请求识别后拒绝并引导至辅助功能。
 - **vendored 第三方 skill 走「已审查文件白名单」而非黑名单扫描**：新增任何 `.py` 都会让测试失败，强制重新逐行审查。见下节。
 - `.env` 永不提交；仓库内只有 `.env.example`。
+- **可观测性是有隐私代价的**：一条 Langfuse trace 含完整 prompt 与 completion，开 Cloud 等于用户未发表的论文正文出境。没有 key 就完全不初始化、不发任何网络请求（`/health` 的 `tracing.langfuse` 可直接确认）。给别人用之前必须挂 `mask=` 脱敏钩子 —— 这是上线门禁，不是优化项；Week 4 自托管的真正理由也在这里，不是省钱。
+- `auth_check()` 不在启动路径上：它是对第三方的阻塞调用，放进 lifespan 会让 Langfuse 慢或不可达时拖住每一次 `uvicorn --reload`。改为后台任务 + 日志。
 
 ---
 

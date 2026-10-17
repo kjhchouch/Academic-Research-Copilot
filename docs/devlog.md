@@ -194,19 +194,89 @@ event: error   data: {"message": "..."}  失败，之后不再有 done
 
 ---
 
+## 2026-10-17 · D3 · 真 agent：LangGraph ReAct + 工具调用 + Langfuse
+
+**做了什么**
+
+后端从「假生成器吐固定文本」换成真的 LangGraph ReAct 图，前端把工具调用画出来，可观测接上 Langfuse Cloud。新增 6 个模块：
+
+- `paper_agent/llm.py` —— `ChatOpenAI` 指向 DeepSeek 的 OpenAI 兼容端点，`deepseek-flash` 跑 Fast Path。
+- `paper_agent/graph/{state,nodes,builder}.py` —— `AgentState` + agent 节点 + `ToolNode`，`tools_condition` 决定是回工具还是收工。
+- `paper_agent/tools/common.py` —— `count_words`（中文按字、西文按词），第一个真工具。选它不是因为有用，是因为**它的返回值可被机械验证**：13 个中文字符就是 13，模型编不出来，测试也不用断言自然语言。
+- `paper_agent/testing.py` —— `ScriptedChatModel` + `tool_call`，把假模型收进包里而不是塞在测试文件中。
+- `paper_agent/prompts/system.py` —— 系统提示词，含「辅助不代写」的产品边界。
+- `paper_agent/observability.py` —— Langfuse 封装。
+
+`chat.py` 换成 `astream(stream_mode=["messages","updates"])`，新增 `tool` 事件（`status: start|end`）；`sseTransport.ts` 把它翻成 AI SDK v7 的 `dynamic-tool` part；`ChatPanel.tsx` 渲染 `ToolChip`（●运行中 / ✓成功 / ✕失败）。
+
+**Langfuse 是本地优先的**：没有 key 就完全不初始化、不发网络请求、不影响任何功能。`/health` 多了 `tracing: {langfuse, host}`，一眼能看出当前进程到底在不在上报。
+
+**坑 / 判断**
+
+1. **★ `messages` 流模式会把 `ToolMessage` 一起吐出来。** `stream_mode=["messages","updates"]` 的 `messages` 通道给的是**所有**经过的消息，包括 tools 节点产出的 `ToolMessage`。第一版按 `langgraph_node != "tools"` 过滤，工具返回的 JSON 照样以 token 形式喷到前端，用户看到的是 `{"cjk_characters": 13, ...}` 混在自然语言里。
+   → 正解是**按类型过滤**：`isinstance(chunk, AIMessageChunk)`。按节点名过滤是脆的——节点一改名就静默失效，而且它表达的是「哪个节点」而不是「这是什么」，后者才是这里真正要问的问题。
+   → 回归测试 `test_chat_does_not_stream_tool_output_as_text` 断言的是**具体字符串不出现**（`cjk_characters` / `latin_words` / `{` / `}`），不是断言 token 数量。数量对也可能内容错。
+2. **★ 同步 `SqliteSaver` 装进异步网关：能启动，第一个请求就炸。** `NotImplementedError: The SqliteSaver does not support async methods. Consider using AsyncSqliteSaver instead.`
+   → **这是本次最重要的一条，因为测试全绿却抓不到。** 测试用 `.invoke()`（同步路径，`SqliteSaver` 支持得好好的），网关用 `astream` / `aget_state`（异步路径，直接抛）。**测试和应用走了两套执行模型，等于没测。** 只有真跑一次 uvicorn 才暴露。
+   → 修法：`make_checkpointer` 改成 `async def`，sqlite 分支返回 `AsyncSqliteSaver` + `aiosqlite`；`aiosqlite` 显式写进 `pyproject.toml`（之前只是碰巧被传递依赖装上了——「在这个 venv 里能跑」不等于「有保证」）；lifespan 退出时关 `conn`（aiosqlite 自己起线程，不关就会在测试套件 / `--reload` 下越攒越多）。
+   → `test_storage.py` 全部改成 `ainvoke` / `astream`，并加了 `test_sqlite_saver_streams` 这条专门守流式路径。持久化测试现在是**用一个 saver 写、关掉、再用第二个 saver 读**——比原来同一个实例读写更强的证明。
+   → `postgres` 分支同时改成显式抛 `NotImplementedError`：`PostgresSaver` 有完全一样的毛病，接上去等于把这个 bug 原样搬到生产。README 里那行「生产用 PostgresSaver」已改。
+3. **`GenericFakeChatModel.bind_tools()` 抛 `NotImplementedError`。** LangChain 自带的假模型不支持绑工具，而 ReAct 图必须 `model.bind_tools(TOOLS)`。所以自己写了 `ScriptedChatModel`。
+   → 它的回复是**按输入里 `AIMessage` 的条数取模**选的。这个耦合很隐蔽：`test_chat_seeds_client_history_on_a_cold_thread` 一开始断言存了 6 条，实际 4 条——因为客户端重放的历史里已经有一个 assistant 轮，模型直接跳到最终答案，工具根本没被调用。测试里写了注释点名这层耦合，否则下一个人会以为是 checkpoint 丢消息。
+4. **★ 历史归服务端管，客户端每轮全量重放。** 客户端重放整个 history，checkpointer 也存了整个 history，两边都发就会重复写。
+   → 规则：**冷 thread 发全量，热 thread 只发 `history[-1:]`**，用 `aget_state` 判断冷热。
+   → 之所以能幂等，是因为 **`add_messages` 按 message id 去重**——把 SDK 的 message id 原样带到 LangChain 是关键一步，id 一变就变成追加。
+   → 跨进程验证过：重启 uvicorn，从 SQLite 还原 4 条消息，客户端重放的那个假首轮**没有**被再写一次（4→6 而不是 4→8），模型直接从 checkpoint 上下文答出「34」，没有再调一次工具。
+5. **工具结果在网关侧解析，不在前端。** `_result_of` 对 `ToolMessage.content` 做一次 `json.loads`，失败就原样返回字符串。
+   → 不然 SSE 线上会出现「JSON 文档套在 JSON 字符串里」，前端要 `JSON.parse` 两次，而且 prose 结果和 JSON 结果长得一样、只能靠试。放在网关是因为**只有网关知道这是工具输出**；失败降级成字符串也保证了非 JSON 工具不会炸。
+6. **langfuse 是 5.x 不是 3.x，`CallbackHandler` 签名换了。** v5 的 `CallbackHandler(*, public_key=None, trace_context=None)` **不收凭据**，它通过 `get_client()` 拿一个进程级单例（`LangfuseResourceManager._instances`，按 public_key 索引）。v3 是直接传 public_key/secret_key/host。
+   → `pyproject.toml` 写的是 `langfuse>=5` 而不是 `>=3`，并留了注释说明为什么：装了 v3 会在 `CallbackHandler()` 上炸一个 unexpected keyword argument——**至少是响的**，比静默什么都不上报好。
+   → v5 基于 OTel，span 是批量攒着定时 flush 的，所以 `shutdown()` 不是可选项。短进程（测试、脚本）不关就等于什么都没发出去。
+7. **trace 属性靠 LangChain config 的 `metadata` 传，不用 `update_current_trace`（v5 没这个 API）。** 保留键：`langfuse_session_id` → session、`langfuse_user_id` → user、`langfuse_trace_name` → trace 名、`langfuse_tags` → tag；普通 `thread_id` 留给 LangGraph 当 resume key；其余进普通 metadata。
+   → `trace_metadata()` 里 **reserved key 最后写**。第一版 `metadata.update(extra)` 放在最后，调用方一个 `thread_id=` 就能把 session 顶掉——`test_trace_metadata_extras_cannot_shadow_a_reserved_key` 是真抓出了这个 bug，不是摆设。
+8. **`auth_check()` 绝不放在启动路径上。** 它是对第三方的阻塞调用；await 在 lifespan 里意味着 Langfuse 慢或不可达时，每次 `uvicorn --reload` 都要陪着等。
+   → 做成 `asyncio.create_task(_report_tracer_auth(...))`，内部 `asyncio.to_thread(verify_tracer, ...)`，成功打 INFO、失败打 WARNING。task 挂在 `app.state` 上——**没有引用的 task 会被 GC 掉**，这是个真会发生的坑。退出时 cancel。
+   → 同理 `shutdown_tracer` 吞掉所有异常：关闭失败不该让进程退不干净。
+9. **`CallbackHandler` 每请求新建，不共享。** 想过在 compile 时绑一个全局的，但**「这次运行属于哪个 trace」是请求的属性，一个在 lifespan 里编译一次的图不可能知道**。放 per-request config 才对。
+   → 代价要写清楚：v5 handler 的 `_pending_resume_trace_contexts` 是实例级的，所以 Week 2 如果加 human-in-the-loop interrupt（一个 thread 跨多次 HTTP 请求），这里必须改成 per-`thread_id` 一个 handler。session 分组不受影响，因为它走的是 `langfuse_session_id`。
+10. **★ 隐私边界必须写进模块 docstring：一条 trace 含完整 prompt 和 completion。** 开 Langfuse Cloud 就等于**用户输入的论文正文出境**。本地开发阶段只有我自己的文本，可以接受；**给别人用之前必须挂 `mask=` 钩子**做 PII / 正文脱敏。这不是以后再说的事，是上线门禁。
+    → 也是「Week 4 自托管」的真正理由——不是省钱，是不想把用户未发表的手稿放在第三方。
+11. **`test_observability.py` 里一个真 Langfuse client 都不建。** 建 client 会注册**进程级** OTel tracer provider，一个测试发的 span 会被后面所有测试的 exporter 捞走。这种泄漏表现为「莫名其妙的网络流量」而不是「测试失败」，最难查。
+    → 真 client 路径由 live run 覆盖（见下）。测试只打桩：`_RaisingClient`（auth_check 抛 ConnectionError、shutdown 抛 RuntimeError）和 `_WorkingClient`。
+12. **★ Langfuse 的旧 REST API 对新组织已经关了。** `GET /api/public/traces` 和 `/api/public/sessions` 返回 **410 `LEGACY_API_UNAVAILABLE_FOR_NEW_ORGANIZATION`**——2026-09-16 之后建的组织一律如此；单条 observation 的端点 `/api/public/observations/{id}` 也是 410，`/api/public/v2/observations/{id}` 是 404，**根本没有 `/api/public/v2/traces`**。v3 端点 2026-11-16 全面下线，服务端版本 4.63.0。
+    → 能用的只有两条：`GET /api/public/v2/observations?fromStartTime=&toStartTime=`，和 `GET /api/public/v2/metrics?query=<urlencoded JSON>`（**是 GET 不是 POST**，POST 报 405）。
+    → metrics 的 query schema 文档我没找到，是**靠 400 的报错信息逐层试出来的**：`dimensions` 要 `[{"field": "..."}]` 不是字符串；`filters` 要带 `"type"` 判别字段；`fromTimestamp`/`toTimestamp` 必填；`sessionId`/`userId` 属高基数维度，必须同时给 `orderBy`（方向 desc）和 `config.row_limit`。measure 名是 `inputTokens`/`outputTokens`/`totalCost` 这种，不是 `usageDetails`。**报错信息把合法枚举全列出来了，这比读文档快。**
+13. **Langfuse 侧的最终验证结果（live，US region，环境 development）**：
+    - **模型名有**：`providedModelName = deepseek-flash`。`/v2/observations` 列表里 `modelId: null` 只是 Langfuse 的价格表里没有这个模型（自定义 `base_url` 的 DeepSeek 匹配不上），**不是没记录**。
+    - **token 用量有**：7 次 generation，input 3621 / output 414 / total 4035，平均延迟 891ms。`usageType` 还拆出了 `output_reasoning` 和 `input_cache_read`——DeepSeek 的推理 token 和缓存命中都被单独统计了。
+    - **成本是 0**：因为价格表里没这个模型，算不出钱。**这不是代码问题**，修法是去 Langfuse Settings → Models 建一个 `deepseek-flash` 自定义模型定义填单价（也可以 `POST /api/public/models`）。**目前成本看板是空的，别误当成「免费」。**
+    - **session / trace 名 / 环境都对**：`sessionId = <thread_id>`、`traceName = chat.fast_path`、`environment = development`。`userId = null` 是**正确的**——还没有鉴权，D8 接上后才有值。
+    - **trace metadata（`ui_context`）无法通过 API 读**：新组织没有可用的 traces 端点。只能在 UI 里看，这一条**未经程序化验证**。
+    - 树形结构完整：`CHAIN LangGraph → AGENT agent → GENERATION ChatOpenAI → CHAIN tools_condition → CHAIN tools → TOOL count_words → AGENT agent → GENERATION ChatOpenAI → CHAIN tools_condition`，工具调用那一轮 9 个 observation，直接回答那一轮 4 个。
+14. **`ToolChip` 不是装饰。** ReAct agent 调完工具再回答，中间有一段用户什么都看不到的静默。把工具调用画出来既是体验，也是「辅助不代写」的**诚实的一半**：回答里的数字明显来自一个用户可检查的工具，而不是模型编的。
+15. **`sseTransport` 里 text part 的 id 必须自增（`sse-text-${textSeq++}`）。** 工具事件会先关掉当前 text part；如果复用同一个 id，重新开的 part 会和 SDK 已经提交过的 part 撞 id。
+16. **工具事件的 args 是整块到达的，不是增量。** 所以 `tool-input-start` 之后立刻发 `tool-input-available`，不需要模拟 delta 流。真要做参数级流式得等 D4 之后，而且要先确认 DeepSeek 的 tool call 分片行为。
+
+**当前门禁**：141 passed / 1 skipped / 3.6s；`ruff check` 全绿；`ruff format --check` 29 files already formatted；`apps/web` 的 `tsc --noEmit` 与 `npm run lint` 干净。live run 两轮实测：第一轮 69 个 token 事件 + `tool start/end`（id 一致）+ `done` 收尾，state 与 `ui_context` 落进 SQLite；第二轮跨进程重启后从 checkpoint 答对，未重复调工具。
+
+---
+
 - [x] ~~装 Docker Desktop~~ → **不需要了**，存储已本地化；Docker 留给 Week 4 部署
 - [x] ~~申请 Semantic Scholar API key（无 key 配额低到没法开发）~~ → **D5 不再被它阻塞**：上游 `nature-academic-search` 已确认 CrossRef / arXiv **无需 key**，PubMed 只要联系邮箱。Semantic Scholar 降级为「有了更好」（它提供引用图谱与 field-of-study 过滤）。
 - [ ] 申请 TypeSafe AI key（D4）
-- [ ] 注册 Langfuse Cloud（D3）
+- [x] ~~注册 Langfuse Cloud（D3）~~ → **已接入并 live 验证**（见 D3 坑 12、13）。key 只在 `.env`。
+- [ ] **在 Langfuse 建 `deepseek-flash` 的自定义模型定义（填单价），否则成本永远是 0。** UI：Settings → Models；API：`POST /api/public/models`。**不是代码问题，别去改 observability.py。**
+- [ ] **给别人用之前必须给 Langfuse 挂 `mask=` 钩子。** 一条 trace 含完整 prompt/completion，开 Cloud 等于用户未发表的手稿出境。这是上线门禁，不是优化项；Week 4 自托管的真正理由也在这。
+- [ ] **Week 2 若加 human-in-the-loop interrupt，`tracer_callbacks` 必须改成 per-`thread_id` 一个 handler**：v5 的 `_pending_resume_trace_contexts` 是实例级的，per-request 新建会让跨请求的 resume 断链。session 分组不受影响。
 - [ ] routing.jsonl 目前 24 条，D7 要凑满 100 条 —— **每天随手追加，别攒到最后编**（现在少于 100 会显示成一条 pytest skip，不是红 CI）。**种子语料已找到**：本机 `nature-suite/SKILL.md` 的关键词表列了 9 类意图 + 中英触发词，抄分类不抄机制。
 - [ ] **skill loader 必须保持 `skills/third_party/` 下六个目录互为兄弟**，否则 12 条 `../nature-shared/*.md` 引用会在 prompt 组装期静默失效（不报错，只掉质量）。D6 实现 loader 时这是硬约束。
 - [ ] **`nature-statistics` 与 `nature-social-science` 是上游 Draft 级**，却分别是「处理数据」和「提供思路」的主力。要用就得补，改动逐条记进 `skills/third_party/PROVENANCE.md` 的修改日志（Apache-2.0 §4(b)）。
 - [ ] 数字保真度 KPI：`nature-shared/scripts/check_consistency.py`（272 行纯 stdlib）是现成参考实现，Verifier 节点可以直接借鉴其 `Finding` 结构，**零 LLM 成本**。
 - [x] ~~整个仓库零测试~~ → **D1 收尾补齐：101 passed / 1 skipped，0.9s**。四个测试文件覆盖 storage / config / API 契约 / routing 数据，并当场抓到 `Path("..").name == ".."` 那个真 bug（见坑 13）。
 - [ ] `apps/web/agents.md` 是 `next dev` 自动生成并会自己加回来的，**别当成自己的改动删掉**（删了只会变成未提交改动，提交了反而脏）。
-- [ ] **D3 之前先给 SSE 协议加事件**：`route` / `tool` / `citation`。前端 transport 已忽略未知事件名，后端可以先加。
+- [x] ~~**D3 之前先给 SSE 协议加事件**：`route` / `tool` / `citation`~~ → **`tool` 已在 D3 落地**（start/end + 前端 `dynamic-tool` part）。`route` 等 D4 意图路由，`citation` 等 Week 2 grounding。前端 transport 对未知事件名是忽略而不是报错，所以后端可以先加、前端后跟。
 - [x] ~~**Week 3 前要决定向量检索走哪条路**~~ → **已定：本地全 SQLite**（`sqlite-vec` + FTS5 `bm25()` + RRF），部署时换 pgvector。见坑 11。
 - [x] ~~`.env` 已从 example 生成，API key 还是空的~~ → **DeepSeek key 已接入并实测通过**（见坑 12）。`CHECKPOINT_BACKEND=sqlite`。
 - [ ] **DeepSeek 余额只剩 ¥3.14（2026-10-14 实测）**。日常开发够用（flash 档单次工具调用约 500 token），但 Week 4 的评测套件（100 条 routing × 多轮 + grounding 逐 claim 蕴含校验）会很紧张，**跑评测前先充值**。
-- [ ] **轮换 DeepSeek key**：这个 key 在聊天里明文发过一次，已落进本地 transcript。`.env` 里那份能用，但建议到控制台重签一个。
-- [ ] Langfuse / TypeSafe(Jev) / Semantic Scholar 三个 key 仍为空，分别卡在 D3 / D4 / D5。
+- [ ] **轮换 DeepSeek key 和 Langfuse key**：两把都在聊天里明文发过一次，已落进本地 transcript。`.env` 里那两份能用（`.env` 已确认未被 git 跟踪），但都该到控制台重签。DeepSeek 泄露的是付费额度，Langfuse 泄露的是**全部 trace 的读权限——里面是完整 prompt 和用户文本**，后者优先级更高。
+- [ ] TypeSafe(Jev) / Semantic Scholar 两个 key 仍为空，分别卡在 D4 / D5。**Langfuse 已填。**

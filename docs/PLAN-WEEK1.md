@@ -13,9 +13,9 @@
 - [x] **零外部服务即可启动**（不需要 Docker；checkpoint 走 SQLite）
 - [x] 前端输入问题，**逐字流式**看到回答（D2 实测：34 分片 / 40ms 间隔 / `text/event-stream`）
 - [ ] 回答里的引用是**真实存在的论文**，点击能跳到 DOI
-- [ ] Langfuse 控制台能看到一条完整 trace：`route → LLM → tool_call → LLM`
+- [ ] Langfuse 控制台能看到一条完整 trace：`route → LLM → tool_call → LLM` —— **D3 已打通 `LLM → tool_call → LLM`（含 token 与延迟），只差 `route` 节点（D4）；成本追踪还没配成，见 D3 验收结果**
 - [ ] 意图路由有**准确率数字**（不是"看起来能用"）
-- [x] 重启后端，对话状态不丢（SQLite checkpointer 已验证真实图往返）
+- [x] 重启后端，对话状态不丢（D3 实测：跨进程重启后从 `data/checkpoints.sqlite` 还原 4 条消息，客户端重放的历史未被重复写入，模型直接从 checkpoint 上下文答对且未重复调工具）
 - [x] README 有架构图 + 本地启动步骤
 
 ---
@@ -182,12 +182,14 @@ D3 往后加 `route` / `tool` / `citation` 事件时，前端 transport **已经
 
 ---
 
-## D3 · 1 天｜LangGraph 第一个 Agent + Langfuse Trace
+## D3 · 1 天｜LangGraph 第一个 Agent + Langfuse Trace ✅ 已完成（2026-10-17）
 
 **装依赖**
 ```bash
 uv add langgraph langgraph-checkpoint-postgres langchain-openai langfuse
 ```
+
+> **实际只装了 `langchain-openai` + `aiosqlite`，`langfuse` 提到 `>=5`，`langgraph-checkpoint-postgres` 刻意没装。** checkpoint 和检索都定在 SQLite（见 devlog 坑 11），postgres 分支现在是显式 `NotImplementedError`。Week 4 真要部署再补。
 
 **最小图**
 ```python
@@ -212,6 +214,15 @@ def build_graph(checkpointer):
 > ✅ **验收**：Langfuse 控制台里一条 trace 展开后能看到 `agent → tool → agent` 的嵌套 span，每个 span 有 token 和耗时。
 >
 > **这一步比看起来重要**：Week 2–4 所有的调试、评测、成本分析都建立在这个 trace 上。今天没接好，后面全是盲调。
+
+**验收结果（2026-10-17，US region live）**
+
+- ✅ 嵌套 span 完整：`LangGraph → agent → ChatOpenAI → tools_condition → tools → count_words → agent → ChatOpenAI → tools_condition`。工具那一轮 9 个 observation，直接回答那一轮 4 个。
+- ✅ token 与耗时**有**：`providedModelName=deepseek-flash`，7 次 generation 合计 input 3621 / output 414 / total 4035，平均延迟 891ms。`usageType` 还拆出 `output_reasoning` 与 `input_cache_read`。
+- ✅ `sessionId=<thread_id>`、`traceName=chat.fast_path`、`environment=development` 全部正确；`userId=null` 是对的，还没接鉴权。
+- ❌ **成本追踪没配成，`totalCost` 恒为 0。** Langfuse 的模型价格表里没有 `deepseek-flash`（自定义 `base_url` 匹配不上），所以算不出钱。修法是在 Langfuse Settings → Models 建一个自定义模型定义填单价（或 `POST /api/public/models`），**不是改代码**。→ Week 4 的「降本 N%」数字现在还没有数据源，这件事优先级要提上来。
+- ⚠️ trace 的 `metadata`（`ui_context`）**无法用 API 验证**：2026-09-16 之后建的组织，`/api/public/traces`、`/api/public/sessions`、`/api/public/observations/{id}` 全部 410 或 404，也没有 `/api/public/v2/traces`。只能读 `/api/public/v2/observations` 列表和 `/api/public/v2/metrics`（GET + urlencoded `query`）。metadata 只在 UI 里看得到。
+- ⚠️ **一条 trace 含完整 prompt 和 completion**，开 Cloud 就等于用户未发表的手稿出境。给自己用可以，给别人用之前必须挂 `mask=` 钩子。这也是 Week 4 自托管的真正理由。
 
 ---
 
@@ -337,7 +348,7 @@ from langgraph.checkpoint.postgres import PostgresSaver   # 需要 psycopg v3，
 
 > ✅ **验收**：杀掉后端进程重启，之前的对话历史还在，能接着聊。
 >
-> **进度**：`storage.py` 的 SQLite 路径已用真实 LangGraph 图跑通往返（invoke → 写入 → `get_state()` 恢复），持久化本身已验证。剩下的是 D3 把 graph 接进 `/api/chat` 后在 HTTP 层复验一次。
+> **进度**：✅ 已完成。D3 把 graph 接进 `/api/chat` 后在 HTTP 层复验，**当场抓到一个测试全绿也发现不了的 bug**：`make_checkpointer` 返回的是同步 `SqliteSaver`，而网关走 `astream` / `aget_state`，能启动、第一个请求就抛 `NotImplementedError`。测试用 `.invoke()`（同步路径）所以一路绿灯。现已改成 `AsyncSqliteSaver` + `aiosqlite`，`test_storage.py` 全部改走异步路径，postgres 分支同步改成显式抛错（它有完全一样的毛病）。详见 devlog D3 坑 2。
 
 **③ 收尾**
 - README：一段话项目定位 + 架构图（用 Mermaid，别画图工具）+ 本地启动步骤 + eval 数字
