@@ -13,7 +13,7 @@
 - [x] **零外部服务即可启动**（不需要 Docker；checkpoint 走 SQLite）
 - [x] 前端输入问题，**逐字流式**看到回答（D2 实测：34 分片 / 40ms 间隔 / `text/event-stream`）
 - [ ] 回答里的引用是**真实存在的论文**，点击能跳到 DOI
-- [ ] Langfuse 控制台能看到一条完整 trace：`route → LLM → tool_call → LLM` —— **D3 已打通 `LLM → tool_call → LLM`（含 token 与延迟），只差 `route` 节点（D4）；成本追踪还没配成，见 D3 验收结果**
+- [ ] Langfuse 控制台能看到一条完整 trace：`route → LLM → tool_call → LLM` —— **D3 已打通 `LLM → tool_call → LLM`（含 token 与延迟），只差 `route` 节点（D4）；成本不在 Langfuse 里，由 `pricing.py` 算，见 D3 验收结果**
 - [ ] 意图路由有**准确率数字**（不是"看起来能用"）
 - [x] 重启后端，对话状态不丢（D3 实测：跨进程重启后从 `data/checkpoints.sqlite` 还原 4 条消息，客户端重放的历史未被重复写入，模型直接从 checkpoint 上下文答对且未重复调工具）
 - [x] README 有架构图 + 本地启动步骤
@@ -220,13 +220,14 @@ def build_graph(checkpointer):
 - ✅ 嵌套 span 完整：`LangGraph → agent → ChatOpenAI → tools_condition → tools → count_words → agent → ChatOpenAI → tools_condition`。工具那一轮 9 个 observation，直接回答那一轮 4 个。
 - ✅ token 与耗时**有**：`providedModelName=deepseek-flash`，7 次 generation 合计 input 3621 / output 414 / total 4035，平均延迟 891ms。`usageType` 还拆出 `output_reasoning` 与 `input_cache_read`。
 - ✅ `sessionId=<thread_id>`、`traceName=chat.fast_path`、`environment=development` 全部正确；`userId=null` 是对的，还没接鉴权。
-- ❌ **成本追踪没配成，`totalCost` 恒为 0。** Langfuse 的模型价格表里没有 `deepseek-flash`（自定义 `base_url` 匹配不上），所以算不出钱。修法是在 Langfuse Settings → Models 建一个自定义模型定义填单价（或 `POST /api/public/models`），**不是改代码**。→ Week 4 的「降本 N%」数字现在还没有数据源，这件事优先级要提上来。
+- ⚠️→✅ **成本追踪：Langfuse 里做不到，已改在代码里算。** 原因是两条，都不是配置漏了：Langfuse 的托管价格表 190 个条目里**一个 DeepSeek 都没有**；而且它的 model definition 表达不了 DeepSeek 的**分时价**（高峰 = UTC 周一至五 01:00–04:00 与 06:00–10:00，排除中国法定节假日，低峰恒为一半）。所以 `totalCost` 在 Langfuse 里**永远是 0，这是已知且刻意的**。
+  → 现在由 `paper_agent/pricing.py` 从 LangChain 的 `usage_metadata` 算，网关每轮打一行日志。live 实测 `turn <id> cost $0.000366 (deepseek-flash=$0.000366)`，与手算逐项吻合。**Week 4 的「降本 N%」有数据源了，而且能做 Langfuse 做不到的反事实比较**（同一轮换成 `deepseek-v4-pro` 要花多少）。详见 devlog「D3 补充」。
 - ⚠️ trace 的 `metadata`（`ui_context`）**无法用 API 验证**：2026-09-16 之后建的组织，`/api/public/traces`、`/api/public/sessions`、`/api/public/observations/{id}` 全部 410 或 404，也没有 `/api/public/v2/traces`。只能读 `/api/public/v2/observations` 列表和 `/api/public/v2/metrics`（GET + urlencoded `query`）。metadata 只在 UI 里看得到。
 - ⚠️ **一条 trace 含完整 prompt 和 completion**，开 Cloud 就等于用户未发表的手稿出境。给自己用可以，给别人用之前必须挂 `mask=` 钩子。这也是 Week 4 自托管的真正理由。
 
 ---
 
-## D4 · 1 天｜Jev 接入 + DecisionModel 抽象层
+## D4 · 1 天｜Jev 接入 + DecisionModel 抽象层 ✅ 已完成（2026-10-18，离线部分）
 
 **装 SDK**
 ```bash
@@ -257,6 +258,29 @@ literature_search · outline · draft_section · polish · citation_format · un
 > ✅ **验收**：写 20 条测试语料（中英混杂、口语化各来几条），两个 backend 都能返回 intent；Langfuse trace 里能看到 Jev 调用的延迟和成本。
 >
 > ⚠️ **今天开始就要攒 eval 语料**。把你想到的每条测试句子追加进 `packages/evals/data/routing.jsonl`，D7 要凑到 100 条。**千万别留到 D7 一次性编** —— 一次性编出来的语料分布是假的，测不出问题。
+
+**验收结果（2026-10-18）**
+
+落地在 `packages/agent/src/paper_agent/routing/`，四个模块：`decision_model.py`（抽象 + 问题集）、`jev.py`、`small_llm.py`、`resilience.py`（熔断 + 缓存 + 级联）。
+
+- ✅ **抽象先于实现**，且 Protocol 签名与本计划写的不一样：`decide(request: RouteInput) -> Decisions`，**不接受 `questions` 参数**。计划里那个签名会让调用方自己构造 `Noul`/`Choice`，等于每个调用点都依赖 Jev 的问题 DSL，抽象就成了装饰。问题集是随版本固定的，不是每次请求现选的，所以它作为数据放在 `decision_model.py`，两个 backend 各自渲染成自己 API 要的格式。
+- ✅ **超时 800ms**，但必须配 `RetryPolicy(max_retries=0)`。SDK 默认 `max_retries=2` + `api_timeout_error=True` + `backoff_initial=0.5`，一次挂死调用实测约 3.7s —— 预算的 4.6 倍，而 `RetryPolicy.timeout=30.0` 那个总预算根本拦不住。
+- ✅ **熔断**：连续 3 次失败打开，30s 后半开，半开只放一个探测。时钟可注入，测试不用真睡 30 秒。
+- ⚠️→✅ **缓存**：计划写「`hash(state)`、Redis、TTL 1h」，两处都改了。内置 `hash()` 对字符串按 `PYTHONHASHSEED` 每进程加盐，跨 worker 不一致、重启即全失效，本地单进程测试还看不出来 —— 改成 sha256(canonical JSON)。Redis 换成了复用已有的 `storage.Cache`（`MemoryCache` 或 `_RedisCache` 都行），本机没有 Redis，不为了一个简历项目起一个。
+- ✅ **6 个 intent** 与 `packages/evals` 门禁里的 `INTENTS` 完全一致，并新增交叉测试保证两边不漂移。故意重复的两份清单必须有测试，否则加了标签只改一边，准确率数字会静默失真。
+- ✅ **两个 Noul**：`.noul` 返回的是 0–1 的**概率**不是 bool，0.5 附近是「模型没决定」。所以两个问题的安全默认值**方向相反**：`needs_clarify` 不确定 → True（猜错槽位产出的是自信的错活，反问只花一轮）；`path_deep` 不确定 → False（重流程是多 agent 管线，且 80% 流量是窄任务）。
+- ✅ **语料 24 → 36 条**：injection 1 → 3（补了间接注入和越狱式注入），并给 `path_deep` 加了 2 真 / 2 假的覆盖 —— 此前这个字段零覆盖，等于快慢双路径这个核心设计无人可测。
+- ✅ **门禁**：344 passed / 1 skipped，ruff clean。
+
+**仍未做**
+
+- ❌ **在线验收**：`TYPESAFE_API_KEY` 还没申请。所以「Langfuse trace 里看到 Jev 的延迟和成本」这条没验。目前所有测试都走 SDK 的 `transport` 假件（真实序列化 + 真实解码 + 真实二值化，只换掉 socket）。`MockTransport` 绕过网络层，httpx 不会启计时器，**所以 800ms 超时能否真的触发无法离线验证** —— 只能钉住配置值和它抛出的异常类型。
+- ❌ **接进图**：按计划属于 D6。目前 `make_router()` 已可用，`config.py` 的 `typesafe_api_key` / `decision_model_backend` / `jev_timeout_ms` 三个字段早就预留好了，接线时注意 **ms → s 要除以 1000**。
+- ❌ **Jev 的成本没有计价**。`pricing.py` 的规则是「未知模型抛错，绝不打成 $0」，而 Jev 的价格表我没有可靠来源，所以只记 token 不算钱。API 文档说 output token 目前免费。
+
+**已知缺口（留给后面的决定）**
+
+产品范围内的「处理数据 / 生成统计代码」在 6 个 intent 里**没有对应标签**。按计划「先只 6 个，不要贪多」，现在加第 7 个是错的；但这类请求目前只能落到 `unclear`，也就是被当成越界拒掉。**没有往语料里塞这一行** —— 因为门禁的 `test_negative_and_injection_expect_unclear` 会反过来保护这个错误标签，等 Week 3 真做数据处理时再加 `data_analysis` 会更干净。
 
 ---
 

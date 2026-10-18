@@ -18,8 +18,12 @@ DATA = Path(__file__).resolve().parents[1] / "data" / "routing.jsonl"
 
 KINDS = {"normal", "ambiguous", "negative", "injection"}
 
-# The intent vocabulary the router is allowed to emit. Kept here rather than in
-# the router so that adding a label is a deliberate, reviewed change.
+# The intent vocabulary the router is allowed to emit. Kept here rather than
+# imported from the router so that adding a label is a deliberate, reviewed
+# change, and so this gate does not import the thing it is grading.
+# test_the_intent_vocabulary_matches_the_router is what stops the two copies from
+# drifting -- without it, a label added to the router and not here would make the
+# dataset reject the router's own output.
 INTENTS = {
     "literature_search",
     "outline",
@@ -84,6 +88,24 @@ def test_labels_come_from_the_intent_vocabulary(rows: list[dict]) -> None:
             assert row["expect"] in INTENTS, f"row {i}: {row['expect']!r} is not a known intent"
 
 
+def test_the_intent_vocabulary_matches_the_router() -> None:
+    """The dataset and the router must agree on the label set.
+
+    Two copies of the same list, checked against each other. A label the router
+    can emit but the dataset does not know makes that label unscoreable -- it
+    counts as a miss forever and nobody can tell whether the router is wrong or
+    the vocabulary is. The reverse is worse: a label the dataset expects but the
+    router cannot produce caps accuracy below 100% no matter how good the routing
+    gets, and looks exactly like a model that needs tuning.
+    """
+    from paper_agent.routing import INTENTS as ROUTER_INTENTS
+
+    assert set(ROUTER_INTENTS) == INTENTS, (
+        f"router emits {sorted(set(ROUTER_INTENTS) - INTENTS)} which the dataset does not grade; "
+        f"dataset expects {sorted(INTENTS - set(ROUTER_INTENTS))} which the router cannot produce"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Labelling discipline — this is what makes the metric trustworthy
 # --------------------------------------------------------------------------- #
@@ -126,6 +148,64 @@ def test_non_ambiguous_rows_assert_an_intent(rows: list[dict]) -> None:
         if row["kind"] == "ambiguous":
             continue
         assert row.get("expect") in INTENTS, f"row has no usable label: {row['query']!r}"
+
+
+# --------------------------------------------------------------------------- #
+# path_deep — the fast/deep split the whole two-path architecture rests on
+# --------------------------------------------------------------------------- #
+
+
+def test_expect_deep_is_boolean_when_present(rows: list[dict]) -> None:
+    """Optional field, but never a maybe. An absent `expect_deep` means "this row
+    does not grade the path split"; a null or a string would silently grade
+    nothing while looking like it grades something."""
+    for row in rows:
+        if "expect_deep" in row:
+            assert isinstance(row["expect_deep"], bool), (
+                f"expect_deep must be a bool or absent: {row['query']!r}"
+            )
+
+
+def test_path_deep_covers_both_outcomes(rows: list[dict]) -> None:
+    """The fast/deep split is the reason there are two paths at all. A dataset
+    that only labels one side cannot measure the decision that matters most --
+    sending a narrow request down the deep path is the expensive mistake, and
+    sending a chapter-level request down the fast path is the one that produces a
+    bad result."""
+    deep = [r for r in rows if r.get("expect_deep") is True]
+    fast = [r for r in rows if r.get("expect_deep") is False]
+    assert deep, "no row expects the deep path"
+    assert fast, "no row expects the fast path"
+
+
+def test_deep_rows_explain_why_they_are_deep(rows: list[dict]) -> None:
+    """Same discipline as the boundary cases.
+
+    "Deep" is a judgement about cost and grounding, not a property of the
+    sentence, so an unexplained `true` is unreviewable -- and the natural way to
+    make a failing metric pass is to relabel rows nobody documented.
+    """
+    for row in rows:
+        if row.get("expect_deep") is not True:
+            continue
+        note = row.get("note")
+        assert isinstance(note, str) and len(note.strip()) >= 6, (
+            f"deep row needs a note saying why it needs the heavy pipeline: {row['query']!r}"
+        )
+
+
+def test_boundary_rows_do_not_claim_a_path(rows: list[dict]) -> None:
+    """A request that is going to be refused has no path.
+
+    Labelling one would make the accuracy number reward the router for choosing a
+    pipeline it should never start, and would hide the case where a jailbreak is
+    correctly identified as out of scope but still routed somewhere expensive.
+    """
+    for row in rows:
+        if row["kind"] in {"negative", "injection"}:
+            assert "expect_deep" not in row, (
+                f"boundary case must not claim a path: {row['query']!r}"
+            )
 
 
 def test_every_boundary_case_explains_itself(rows: list[dict]) -> None:

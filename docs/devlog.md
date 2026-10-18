@@ -261,14 +261,108 @@ event: error   data: {"message": "..."}  失败，之后不再有 done
 
 ---
 
+## 2026-10-17 · D3 补充 · 成本自己算，不用 Langfuse 的价格表
+
+D3 验收时 Langfuse 的 `totalCost` 恒为 0，本来打算去后台建一个 `deepseek-flash` 的自定义模型定义。**查完发现这条路走不通，改成在代码里算。** 新增 `paper_agent/pricing.py`（纯函数，不依赖 LangChain）+ 网关每轮一行成本日志。
+
+**为什么 Langfuse 的价格表不行**
+
+1. **它的托管价格表里没有 DeepSeek。** 不是「没匹配上」，是压根没有——分页拉完 190 个条目，全是 OpenAI / Anthropic / Google，一个 deepseek / qwen / mistral 都没有。
+2. **就算手写一条也表达不了真实价目。** DeepSeek 按时段计价：高峰是 **UTC 周一至周五 01:00–04:00 与 06:00–10:00，且排除中国法定节假日**，低峰恒为高峰的一半。model definition 有 `startDate` 和 pricing tiers，但没有「一天中的第几个小时」这个维度，更没有节假日日历。**不管填哪一档，误差最多 2×，而且方向随钟点变。**
+3. 配置存在 Langfuse 账号里，**不进 git**：换机器、重建 project、把仓库给别人看，成本又变 0，且没人知道为什么。
+
+它唯一能正确处理的是缓存命中/未命中分档（Langfuse 已经把它们记成不同的 `usageType`）——而这一档恰恰是最要命的，见下。
+
+**官方现价（2026-10-17 查 api-docs.deepseek.com，USD / 1M token）**
+
+| | deepseek-flash（V4.1-Flash） | deepseek-v4-pro |
+|---|---|---|
+| 输入 · 缓存命中 | 低峰 $0.003 / 高峰 $0.006 | 低峰 $0.022 / 高峰 $0.044 |
+| 输入 · 缓存未命中 | 低峰 $0.15 / 高峰 $0.30 | 低峰 $0.66 / 高峰 $1.32 |
+| 输出 | 低峰 $0.6 / 高峰 $1.2 | 低峰 $1.98 / 高峰 $3.96 |
+
+**坑 / 判断**
+
+1. **★ 2026-08-16 涨过一次价，缓存命中涨幅最高约 1114%。** 搜索命中的两篇 7 月博客给的 `$0.14 / $0.0028 / $0.28` 是**涨价前的旧数字**。抄第三方博客的价格表 = 静默算错钱。所以 `ModelPrice` 里带了 `effective` 日期和 `source` URL，**过期是可见的**，不是靠记忆。
+2. **★ `cache_read` 是 `input_tokens` 的子集，不是加项。** 这条是从 `langchain_core.messages.ai.UsageMetadata` 的源码 docstring 读出来的，不是猜的：`input_tokens` 明写「Sum of all input token types」，`input_token_details` 明写「Does *not* need to sum to full input token count」。**当成加项就会把每个命中缓存的 prompt 双算。**
+   → live 实测这一档有多大：一次工具调用轮的第二次 generation，`input_tokens=966` 里 `cache_read=768`，**占 79%**。全按未命中价算会把成本高报约 4×。这不是理论风险。
+3. **★ `reasoning` 同理，已含在 `output_tokens` 里。** DeepSeek 思考模式的推理 token 量不小（实测一轮 174 + 56），再算一遍约等于把输出成本翻倍。`test_reasoning_tokens_are_not_billed_twice` 钉住这条。
+4. **★ 自己的测试抓到一个真时区 bug。** `is_peak` 第一版写了 `utc = at if at.tzinfo is not None else at.replace(tzinfo=UTC)`——**判断了是否带时区，然后直接读 `at.hour`，没有真的转成 UTC**。传一个 `+08:00` 的 aware datetime 进去，读的是北京时间的钟点。本机就是 UTC+8，这个 bug 会把高峰窗口整体挪 8 小时。
+   → 修成 `at.astimezone(UTC) if at.tzinfo is not None else at.replace(tzinfo=UTC)`。两个分支不能合并成一句 `at.astimezone(UTC)`：那样 naive datetime 会被按**本地时间**解释，正好是文档里说要避免的。
+   → 顺带：`holidays` 比的是 **UTC 日期**，而 DeepSeek 说的是北京日历日，所以即使传了节假日集合，当天的头尾各 8 小时仍可能判错。写进 docstring 了，不装作解决了。
+5. **设计规则：未知模型抛 `UnknownModelError`，绝不定价为 0。** 这是整个模块的存在理由——Langfuse 看板上 `$0.00` 和「忘了配价格」长得一模一样。同理，**provider 没上报 usage 时记的是 `cost unknown`，不是 `$0`**。
+6. **成本日志放在 `finally` 里。** 上游 500、或者用户直接关页面，token 都已经花掉了——**那正是最想知道花了多少的时候**。
+7. **按 `(model, peak)` 聚合，不逐次 generation 列。** 第一版 live 打出来是 `deepseek-flash=$0.000260, deepseek-flash=$0.000111`，看着像双算 bug。peak 留在 key 里，所以跨 04:00 / 10:00 UTC 边界的轮次仍会分成两行报——精度没丢。
+8. **`format_usd` 用 6 位小数，不用 2 位。** 一轮的成本是 `$0.000366`；打成 `$0.00` 就又把「很便宜」和「没算出来」混成一件事了。第一版试过「分」为单位（`0.0211c`），可读性更差，弃。
+9. **模型名取 `response_metadata["model_name"]`，不取我们请求时填的名字。** DeepSeek 接受已退役的旧名（`deepseek-v4-flash`）并路由到别的模型；用请求名计价会把这种漂移藏起来。实测返回的就是 `deepseek-flash`，与价格表 key 一致。
+10. **刻意不建模的两件事**：中国法定节假日（默认空集合，落在工作日的节假日会按高峰算，**高估上限 2×、方向已知**，好过维护一张会静默腐烂的节假日表）；汇率（DeepSeek 以 USD 计价，余额可能按 CNY 显示，硬编一个每天在动的汇率不如全程 USD）。
+11. **价格表是 Python 字面量，不是 TOML。** 一年改几次、和用它的算术在同一次 diff 里被 review、不需要路径解析 / 打包配置 / 解析失败分支。数据文件在这里买不到任何东西。
+12. 顺手修掉一条噪音：`ui_context` 为 None 时 Langfuse 每个请求都打 `Propagated attribute 'metadata.ui_context' is None. Dropping value.`。改成 None 就整个不传。
+
+**实测量级**：一次工具调用轮 ≈ **$0.00037**（约 570 token 输入 + 两次 generation）。按 ¥3.14 余额（≈$0.44）算够跑 **~1200 轮**——日常开发完全不是瓶颈，Week 4 的评测套件才是。
+
+**当前门禁**：183 passed / 1 skipped / 3.3s；`ruff check` 全绿；`ruff format --check` 31 files already formatted。live run 三轮实测，成本行输出 `turn <id> cost $0.000366 (deepseek-flash=$0.000366)`，数字与手算逐项吻合。
+
+**仍未做**：拿 DeepSeek 控制台的真实账单对一次账。官方说明写明「优先扣赠送额度」，所以「按单价算出来的数」和「余额实际减少的数」本来就未必相等——这个对账是「成本数字不是拍的」的唯一硬证据。
+
+---
+
+## 2026-10-18 · D4 · Jev 接入 + DecisionModel 抽象层（离线部分完成）
+
+落地 `packages/agent/src/paper_agent/routing/` 四个模块 + 156 条新测试。`TYPESAFE_API_KEY` 还没申请，所以**全部验收都是离线的**——走 SDK 的 `transport` 假件，跑真实序列化、真实解码、真实 pydantic 校验，只换掉 socket。
+
+**先核实工具再写集成**，这一步救了三次：
+
+1. **差点以为官方文档是错的。** 文档示例写 `result.nouls["billing"].noul`，但反射 `SystemOneResponse` 的 `model_fields` 只有 `model / usage / answers`——`.nouls` 根本不在里面。**真相是 `.nouls / .choices / .scores / .boxes` 是 `cached_property`，不是 pydantic 字段**，所以按 `model_fields` 反射会漏掉一半 API。照反射结果写就会去读 `answers` 然后自己分类，白写一遍 SDK 已经做好的事。
+2. **`.nouls` 是对 `answers` 的过滤视图，不是服务端保证的键。** 而且解码器对不认识的 answer type 是**静默丢弃**（前向兼容，只打一条 warning）。所以 `resp.nouls["path_deep"]` 在服务端漏答或 SDK 版本落后时是 `KeyError`——一个路由细节 500 掉整个请求。全部改 `.get()`，缺失就当「模型没决定」走安全默认值。
+3. **`.noul` 返回 0–1 的概率，不是 bool**，且文档明说 0.5 附近是「不确定」而非「随便舍入」。所以需要一个带阈值 + 不确定带的二值化，而**两个问题的安全默认值方向相反**：`needs_clarify` 不确定 → True（猜错槽位产出的是自信的错活，用户得发现并撤销；反问只花一轮），`path_deep` 不确定 → False（重流程是多 agent 管线，且 80% 流量是窄任务，先验也指向这边）。一个模块级默认值必然对其中一个问题是错的。
+
+**计划里两处按实测改了**：
+
+4. **SDK 默认重试会把 800ms 预算吃成 ~3.7s。** 默认 `max_retries=2` + `api_timeout_error=True`（超时**会**被重试）+ `backoff_initial=0.5` 翻倍，实测算下来 `0.8+0.45+0.8+0.9+0.8`。而 `RetryPolicy.timeout=30.0` 那个「总重试预算」拦不住——3.7s 远在 30s 以内。**必须 `RetryPolicy(max_retries=0)`。** 一个以「快」为唯一目的调用，超时后正确反应是换后端回答，不是再等一次。除了钉常量，还加了行为测试：500 时 handler 只被调用一次。
+5. **`hash(state)` 是个陷阱。** 内置 `hash()` 对 str 按 `PYTHONHASHSEED` **每进程加盐**：跨 worker 键不一致（共享 Redis 永不命中）、重启即全部失效，而本地单进程跑测试**完全看不出来**。改成 `sha256(canonical JSON, sort_keys=True)`——`sort_keys` 也是必须的，否则客户端换个 ui_context 键顺序就是一次缓存未命中，现象是「缓存好像根本没生效」。测试里钉了一个金标准 digest，脆但值得：这个失败除了看字节没有别的观测方式。
+
+**设计上几个判断**：
+
+6. **Protocol 签名和计划写的不一样。** 计划是 `decide(state, questions)`——那会让每个调用点自己构造 `Noul`/`Choice`，等于全仓库依赖 Jev 的问题 DSL，`SmallLLMBackend` 沦为「重新解释它本不该懂的对象」，抽象就成了装饰。问题集是**随版本固定的**（要拿 eval 语料调、改了准确率数字的含义就变了），不是每次请求现选的，所以它作为数据放在 `decision_model.py`，两个 backend 各自渲染。
+7. **`DecisionUnavailable` 是异常，不是哨兵返回值。** 「后端挂了」和「自信地判定 unclear」对调用方是两件事：前者要跳熔断并交给降级，后者是真答案、绝不能重试。合并成一个值会让熔断器把一段难路由的对话统计成宕机，然后在最不该降级的时候降级。
+8. **static fallback 绝不进缓存。** 它的含义是「所有后端都失败了」。缓存一小时 = 让宕机比它的成因活得更久，用户在后端恢复之后还在被要求重说一遍。
+9. **缓存键里折进了问题集指纹。** criteria **就是** prompt：调完 criteria，旧缓存里存的是「另一个问题的答案」。不加指纹的现象是「照 eval 调了半天 prompt，一小时没效果」，正好把人引去 debug 错误的层。
+10. **六种失败模式收敛成一个异常类型。** 实测 0.7.5 的映射：`ReadTimeout`→`TypeSafeAPITimeoutError`、`ConnectError`→`TypeSafeAPIConnectionError`、500→`InternalServerError`、429→`RateLimitError`、401→`AuthenticationError`、非 JSON body→`APIResponseValidationError`。全泄漏上去会让 `resilience.py` 反向 import Jev SDK，熔断器还得按厂商分支。
+11. **`SmallLLMBackend` 用裸 JSON 手工解析，不用 `with_structured_output`。** 两个理由：structured output 走 tool calling / JSON-schema 模式，会把**降级路径**绑到「支持它的模型」上；更直接的是 `ScriptedChatModel.bind_tools` 是个返回自身的 no-op，用了就没法离线测。降级后端该有的属性是「除了能吐字之外不要求任何能力」。
+12. **`INTENTS` 两份清单加了交叉测试。** evals 门禁**故意**不 import router（不该 import 被它评分的东西），但故意重复仍需测试，否则加标签只改一边、准确率数字会静默失真。做了变异验证：给 router 加一个 `summarize`，**3 个测试同时红**。
+13. **`decisions_from_json` 承诺「绝不抛」，第一版漏了 `AttributeError`。** `probabilities` 是 `5` 的时候 `.items()` 就炸——测试当场抓到。缓存如果能抛异常，加缓存反而让路由比不加更不可靠。
+
+**离线测试能证明什么，不能证明什么**：
+
+14. **`MockTransport` 绕过网络层，httpx 不会启计时器**——handler 里 `sleep` 只是晚返回，**超时根本不会触发**。所以「800ms 到点降级」这条**无法离线行为验证**，只能钉住配置值（`_config.timeout`）+ 钉住超时抛出的异常类型会走 `DecisionUnavailable`。这条边界写进测试 docstring 了，不假装覆盖了。
+15. **`transport` 这个 seam 值回票价**：跑的是真实请求序列化 + 真实响应解码 + 真实二值化。比 mock `decide` 有用得多——后者测的是 mock。
+
+**eval 语料 24 → 36 条**（计划要求「从今天开始每天攒，别留到 D7 一次性编」）：injection 1 → 3（补了**间接注入**——指令藏在待总结的文献正文里，这正是「检索回来的内容是不可信输入」那条边界的用例；和**越狱式注入**——先角色扮演解除限制再索取整篇代写）。
+
+16. **`path_deep` 此前零覆盖。** 快慢双路径是整个架构的第一条设计判断，却没有任何一条语料能测它。补了 2 真 2 假，并加了两条门禁：deep 行**必须写 note 说明为什么重**（和 boundary 行同一套纪律——「deep」是对成本与 grounding 的判断，不是句子的属性，无说明的 `true` 无法 review）；**boundary 行不许声明 path**（被拒的请求没有路径，给它标路径等于奖励 router 去选一条它本不该启动的管线，还会掩盖「越狱被正确识别为越界、却仍被路由到昂贵管线」这种情况）。
+
+**当前门禁**：344 passed / 1 skipped / 5.0s；`ruff check` 全绿；`ruff format --check` 38 files already formatted。（D3 收尾时是 183 passed / 31 files。）
+
+**仍未做**
+
+- **在线验收**：`TYPESAFE_API_KEY` 未申请，所以计划里「Langfuse trace 能看到 Jev 的延迟和成本」这条**没验**。拿到 key 后要做三件事：真实网络下确认 800ms 够用（离线测不了，见坑 14）、trace 里确认延迟与 token、用真实 `SmallLLMBackend` 跑全量语料得到第一份真实准确率。
+- **Jev 的成本没有计价。** `pricing.py` 的规则是「未知模型抛错，绝不打成 $0」，而 Jev 的价格我没有可靠来源，所以只记 token 不算钱。（API 文档说 output token 目前免费，所以 input 才是要看的那个数。）
+- **接进图属于 D6。** `make_router()` 已可用，`config.py` 的 `typesafe_api_key / decision_model_backend / jev_timeout_ms` 三个字段早就预留好了，接线时注意 **ms → s 要除以 1000**。
+- **词汇表缺口：「处理数据 / 生成统计代码」在 6 个 intent 里没有对应标签。** 按计划「先只 6 个不要贪多」，现在加第 7 个是错的；但这类请求目前只能落到 `unclear`，也就是被当越界拒掉。**刻意没有往语料里塞这一行**——门禁的 `test_negative_and_injection_expect_unclear` 会反过来**保护**这个错误标签，等 Week 3 真做数据处理时加 `data_analysis` 更干净。
+
+---
+
 - [x] ~~装 Docker Desktop~~ → **不需要了**，存储已本地化；Docker 留给 Week 4 部署
 - [x] ~~申请 Semantic Scholar API key（无 key 配额低到没法开发）~~ → **D5 不再被它阻塞**：上游 `nature-academic-search` 已确认 CrossRef / arXiv **无需 key**，PubMed 只要联系邮箱。Semantic Scholar 降级为「有了更好」（它提供引用图谱与 field-of-study 过滤）。
-- [ ] 申请 TypeSafe AI key（D4）
+- [ ] **申请 TypeSafe AI key（D4）** → **D4 的代码不再被它阻塞**（`transport` 假件可离线全测），但**在线验收被它阻塞**：800ms 超时能否真触发、Langfuse 里的 Jev 延迟与 token、真实准确率，三件事都要真 key。
 - [x] ~~注册 Langfuse Cloud（D3）~~ → **已接入并 live 验证**（见 D3 坑 12、13）。key 只在 `.env`。
-- [ ] **在 Langfuse 建 `deepseek-flash` 的自定义模型定义（填单价），否则成本永远是 0。** UI：Settings → Models；API：`POST /api/public/models`。**不是代码问题，别去改 observability.py。**
+- [x] ~~**在 Langfuse 建 `deepseek-flash` 的自定义模型定义（填单价），否则成本永远是 0**~~ → **这条路走不通，改成在代码里算**（`paper_agent/pricing.py`，见 D3 补充）。两个原因：Langfuse 托管价格表 190 个条目里**一个 DeepSeek 都没有**；而且 model definition 表达不了 DeepSeek 的**高峰/低峰分时价**（UTC 周一至五 01:00–04:00 与 06:00–10:00，排除中国法定节假日，低峰恒为一半）。**Langfuse 看板的成本从此就是 0，这是已知且刻意的**——别再去后台点模型定义，也别把它当成 bug 修。
+- [ ] **拿 DeepSeek 控制台的真实账单对一次账**，验证 `pricing.py` 的单价表。官方说明「优先扣赠送额度」，所以按单价算的数与余额实际减少的数未必相等——对账要连这条一起解释清楚。这是「成本数字不是拍的」的唯一硬证据。
+- [ ] **`pricing.py` 的价格表带 `effective` 日期（当前 2026-08-16）与 `source` URL，隔一段时间要回去核一次。** DeepSeek 上一次调价缓存命中涨了约 1114%，而搜索能命中的中文/英文博客大多还是涨价前的数字。
 - [ ] **给别人用之前必须给 Langfuse 挂 `mask=` 钩子。** 一条 trace 含完整 prompt/completion，开 Cloud 等于用户未发表的手稿出境。这是上线门禁，不是优化项；Week 4 自托管的真正理由也在这。
 - [ ] **Week 2 若加 human-in-the-loop interrupt，`tracer_callbacks` 必须改成 per-`thread_id` 一个 handler**：v5 的 `_pending_resume_trace_contexts` 是实例级的，per-request 新建会让跨请求的 resume 断链。session 分组不受影响。
-- [ ] routing.jsonl 目前 24 条，D7 要凑满 100 条 —— **每天随手追加，别攒到最后编**（现在少于 100 会显示成一条 pytest skip，不是红 CI）。**种子语料已找到**：本机 `nature-suite/SKILL.md` 的关键词表列了 9 类意图 + 中英触发词，抄分类不抄机制。
+- [ ] routing.jsonl 目前 **36 条**（D4 从 24 加到 36），D7 要凑满 100 条 —— **每天随手追加，别攒到最后编**（现在少于 100 会显示成一条 pytest skip，不是红 CI）。**种子语料已找到**：本机 `nature-suite/SKILL.md` 的关键词表列了 9 类意图 + 中英触发词，抄分类不抄机制。**新增 `expect_deep` 字段**（快慢路径标签，此前零覆盖），带两条门禁：deep 行必须写 note 说明为什么重、boundary 行不许声明 path。
 - [ ] **skill loader 必须保持 `skills/third_party/` 下六个目录互为兄弟**，否则 12 条 `../nature-shared/*.md` 引用会在 prompt 组装期静默失效（不报错，只掉质量）。D6 实现 loader 时这是硬约束。
 - [ ] **`nature-statistics` 与 `nature-social-science` 是上游 Draft 级**，却分别是「处理数据」和「提供思路」的主力。要用就得补，改动逐条记进 `skills/third_party/PROVENANCE.md` 的修改日志（Apache-2.0 §4(b)）。
 - [ ] 数字保真度 KPI：`nature-shared/scripts/check_consistency.py`（272 行纯 stdlib）是现成参考实现，Verifier 节点可以直接借鉴其 `Finding` 结构，**零 LLM 成本**。
@@ -279,4 +373,5 @@ event: error   data: {"message": "..."}  失败，之后不再有 done
 - [x] ~~`.env` 已从 example 生成，API key 还是空的~~ → **DeepSeek key 已接入并实测通过**（见坑 12）。`CHECKPOINT_BACKEND=sqlite`。
 - [ ] **DeepSeek 余额只剩 ¥3.14（2026-10-14 实测）**。日常开发够用（flash 档单次工具调用约 500 token），但 Week 4 的评测套件（100 条 routing × 多轮 + grounding 逐 claim 蕴含校验）会很紧张，**跑评测前先充值**。
 - [ ] **轮换 DeepSeek key 和 Langfuse key**：两把都在聊天里明文发过一次，已落进本地 transcript。`.env` 里那两份能用（`.env` 已确认未被 git 跟踪），但都该到控制台重签。DeepSeek 泄露的是付费额度，Langfuse 泄露的是**全部 trace 的读权限——里面是完整 prompt 和用户文本**，后者优先级更高。
-- [ ] TypeSafe(Jev) / Semantic Scholar 两个 key 仍为空，分别卡在 D4 / D5。**Langfuse 已填。**
+- [ ] TypeSafe(Jev) / Semantic Scholar 两个 key 仍为空。Semantic Scholar 卡在 D5（且已降级为「有了更好」）；TypeSafe 只卡 D4 的**在线验收**，代码与离线测试都已完成。**Langfuse 已填。**
+- [ ] **D4 的 `Decisions` 尚未接进 `AgentState`。** `graph/state.py` 的 docstring 里预留了 `intent / slots / missing_slots / guard / route_source` 五个字段，D6 接线时再加——现在加就是无人读的字段，每个都要进 checkpoint。`route` SSE 事件同理（前端对未知事件名是忽略而非报错，所以后端可以先加）。

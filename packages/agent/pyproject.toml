@@ -19,12 +19,12 @@ dependencies = [
     # directly, so a v3 install would fail on an unexpected keyword argument --
     # loudly, at least, rather than silently tracing nothing.
     "langfuse>=5",
+    "typesafe-sdk>=0.7.5",
 ]
 
 # langgraph-checkpoint-postgres deliberately NOT added: retrieval and
 # checkpointing both settled on SQLite (see README "开发计划" and devlog 坑 11).
 # Add it in Week 4 if deployment actually needs Postgres.
-# D4 adds: typesafe-sdk
 # D5 adds: mcp[cli]
 
 [dependency-groups]
