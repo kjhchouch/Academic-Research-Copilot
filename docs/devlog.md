@@ -190,7 +190,7 @@ event: error   data: {"message": "..."}  失败，之后不再有 done
 16. **git clone 到 github.com 会中途断流**：第一次 `--depth 1` 报 `fatal: fetch-pack: invalid index-pack output` + `unexpected disconnect while reading sideband packet`。加 `-c http.postBuffer=524288000 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60` 重试即成功。`raw.githubusercontent.com` 在这台机器上直接返回 000，但 `api.github.com` 通。
 17. **`skills/third_party/*/tests/` 不在 `testpaths` 里，是刻意的**：那是上游的测试，收进来等于把我们的套件耦合到不自维护的代码上。写了一条测试守住这个配置，防止有人图省事把 `skills` 加进 `testpaths`。
 
-**当前门禁**：118 passed / 1 skipped / 1.0s；`ruff check` 全绿；`ruff format --check` 21 files already formatted。vendored 树经 `diff -r` 逐字节比对确认与上游 `19be8d4` 一致——所以 `NOTICE` 里那句 verbatim 是**验证过的**，不是声明。
+**当前门禁**：118 passed / 1 skipped / 1.0s；`ruff check` 全绿；`ruff format --check` 20 files（18 py + 2 md）already formatted。vendored 树经 `diff -r` 逐字节比对确认与上游 `19be8d4` 一致——所以 `NOTICE` 里那句 verbatim 是**验证过的**，不是声明。
 
 ---
 
@@ -257,7 +257,7 @@ event: error   data: {"message": "..."}  失败，之后不再有 done
 15. **`sseTransport` 里 text part 的 id 必须自增（`sse-text-${textSeq++}`）。** 工具事件会先关掉当前 text part；如果复用同一个 id，重新开的 part 会和 SDK 已经提交过的 part 撞 id。
 16. **工具事件的 args 是整块到达的，不是增量。** 所以 `tool-input-start` 之后立刻发 `tool-input-available`，不需要模拟 delta 流。真要做参数级流式得等 D4 之后，而且要先确认 DeepSeek 的 tool call 分片行为。
 
-**当前门禁**：141 passed / 1 skipped / 3.6s；`ruff check` 全绿；`ruff format --check` 29 files already formatted；`apps/web` 的 `tsc --noEmit` 与 `npm run lint` 干净。live run 两轮实测：第一轮 69 个 token 事件 + `tool start/end`（id 一致）+ `done` 收尾，state 与 `ui_context` 落进 SQLite；第二轮跨进程重启后从 checkpoint 答对，未重复调工具。
+**当前门禁**：141 passed / 1 skipped / 3.6s；`ruff check` 全绿；`ruff format --check` 30 files（27 py + 3 md）already formatted；`apps/web` 的 `tsc --noEmit` 与 `npm run lint` 干净。live run 两轮实测：第一轮 69 个 token 事件 + `tool start/end`（id 一致）+ `done` 收尾，state 与 `ui_context` 落进 SQLite；第二轮跨进程重启后从 checkpoint 答对，未重复调工具。
 
 ---
 
@@ -301,7 +301,7 @@ D3 验收时 Langfuse 的 `totalCost` 恒为 0，本来打算去后台建一个 
 
 **实测量级**：一次工具调用轮 ≈ **$0.00037**（约 570 token 输入 + 两次 generation）。按 ¥3.14 余额（≈$0.44）算够跑 **~1200 轮**——日常开发完全不是瓶颈，Week 4 的评测套件才是。
 
-**当前门禁**：183 passed / 1 skipped / 3.3s；`ruff check` 全绿；`ruff format --check` 31 files already formatted。live run 三轮实测，成本行输出 `turn <id> cost $0.000366 (deepseek-flash=$0.000366)`，数字与手算逐项吻合。
+**当前门禁**：183 passed / 1 skipped / 3.3s；`ruff check` 全绿；`ruff format --check` 32 files（29 py + 3 md）already formatted。live run 三轮实测，成本行输出 `turn <id> cost $0.000366 (deepseek-flash=$0.000366)`，数字与手算逐项吻合。
 
 **仍未做**：拿 DeepSeek 控制台的真实账单对一次账。官方说明写明「优先扣赠送额度」，所以「按单价算出来的数」和「余额实际减少的数」本来就未必相等——这个对账是「成本数字不是拍的」的唯一硬证据。
 
@@ -342,7 +342,13 @@ D3 验收时 Langfuse 的 `totalCost` 恒为 0，本来打算去后台建一个 
 
 16. **`path_deep` 此前零覆盖。** 快慢双路径是整个架构的第一条设计判断，却没有任何一条语料能测它。补了 2 真 2 假，并加了两条门禁：deep 行**必须写 note 说明为什么重**（和 boundary 行同一套纪律——「deep」是对成本与 grounding 的判断，不是句子的属性，无说明的 `true` 无法 review）；**boundary 行不许声明 path**（被拒的请求没有路径，给它标路径等于奖励 router 去选一条它本不该启动的管线，还会掩盖「越狱被正确识别为越界、却仍被路由到昂贵管线」这种情况）。
 
-**当前门禁**：344 passed / 1 skipped / 5.0s；`ruff check` 全绿；`ruff format --check` 38 files already formatted。（D3 收尾时是 183 passed / 31 files。）
+**文档里的数字也要测**：
+
+17. **★ 这份 devlog 里四个「files already formatted」全是估的，逐个 commit 重测后没有一个对。** 起因只是 D4 这行写 38、实测 39。顺手用 `git archive <commit> | tar -x` 把历史快照解到临时目录重跑 ruff（不动工作区、不 checkout），结果：`aab6786` 声称 21 实为 **20**、`f77eccc` 声称 29 实为 **30**、`235bdf0` 声称 31 实为 **32**、`abbf3af` 声称 38 实为 **39**。
+   → **偏差方向不一致**（一个偏大、三个偏小），所以不是笔误，是「拿上次的数 + 新增文件数」推出来的。而 ruff ≥0.17 会格式化 Markdown 里的 Python 代码块，`.md` 也进计数：`aab6786` 时是 2 个、之后 3 个——光靠加法必然算错。四处现已改成 `N files（M py + K md）`。**混两种文件类型的计数本身就是个坏指标**：它对不上任何人的心智模型，所以错了也没人看得出来。
+   → **边界：同一行的 `passed` 数没有重测**，只有 HEAD 的 344 是本次实测。要在快照里跑 pytest 得装一套 venv，而 workspace 的 editable install 会指回 `E:\agent` 的源码，测的就不是快照了。所以那三个历史 `passed` 数**仍是未验证的自述**，引用时按这个折扣。
+
+**当前门禁**：344 passed / 1 skipped / 5.0s；`ruff check` 全绿；`ruff format --check` 39 files（36 py + 3 md）already formatted。（D3 收尾时是 183 passed / 32 files。）
 
 **仍未做**
 
