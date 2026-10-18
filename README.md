@@ -36,7 +36,7 @@ graph TD
     SK["Skill 系统<br/>三级渐进披露 · agentskills.io 格式"]
     MCP["MCP 工具<br/>literature-search · pdf-parse · citation-format"]
     MEM["记忆层<br/>session state + compaction · FTS+向量双路召回"]
-    OBS["Langfuse<br/>全链路 trace · eval · 成本"]
+    OBS["Langfuse<br/>全链路 trace · eval"]
 
     UI --> GW --> RT
     RT --> Fast
@@ -58,6 +58,7 @@ graph TD
 - **子 agent 通过 typed State 通信**，从不直接对话。传裁剪过的 view 而非整个 state；上下文隔离是拆子 agent 的唯一正当理由。
 - **引用必须可验证**：每条 claim 绑定到检索时的精确 span，蕴含校验不通过则标红并带诊断回退重检索。
 - **Skill 不允许 agent 自己改**：只能通过 PR 修改，改 frontmatter 必须过 routing eval 的 CI 门禁。与 Hermes Agent 的自我改进闭环相反 —— 在需要审计的垂直场景，可控性优先于灵活性。
+- **成本自己算，不交给可观测平台**：Langfuse 的托管价格表里没有任何 DeepSeek 模型，而它的 model definition 也表达不了分时价（高峰/低峰差 2×，还要排除中国法定节假日）。`pricing.py` 从 `usage_metadata` 直接算，按 UTC 时段选档、缓存命中单列计价。规则是**未知模型抛错、provider 没上报 usage 就记 `cost unknown`，两者都绝不打成 $0** —— 看板上 `$0.00` 和「忘了配价格」长得一模一样，正是这个模块要消除的混淆。
 
 ---
 
@@ -72,7 +73,7 @@ graph TD
 | 决策模型 | TypeSafe AI Jev（意图路由 / grounding 蕴含校验 / 注入检测） |
 | 检索 | 本地 `sqlite-vec` + FTS5 `bm25()` → 部署 pgvector HNSW + `tsvector` · RRF 融合 · cross-encoder rerank |
 | 工具协议 | MCP |
-| 可观测 | Langfuse（Week 1–3 用 Cloud，Week 4 自托管） |
+| 可观测 | Langfuse trace（Week 1–3 用 Cloud，Week 4 自托管）· 成本自算：`paper_agent/pricing.py`，含 DeepSeek 分时价与缓存命中分档 |
 | 数据源 | OpenAlex · Semantic Scholar · Crossref · arXiv |
 | 基础设施 | Docker Compose · GitHub Actions |
 

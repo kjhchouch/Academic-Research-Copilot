@@ -38,12 +38,15 @@ import json
 import logging
 import uuid
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 from paper_agent.graph import DEFAULT_RECURSION_LIMIT
 from paper_agent.observability import trace_metadata, tracer_callbacks
+from paper_agent.pricing import UnknownModelError, cost_of, format_usd
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sse_starlette.sse import EventSourceResponse
 
@@ -228,6 +231,12 @@ def _public_error(exc: Exception) -> str:
     return f"upstream error ({name})"
 
 
+# message id -> (model name, usage_metadata). Keyed by id because one streamed
+# generation arrives as many chunks that each repeat the cumulative total; the
+# last write wins, which is the correct one.
+type UsageByMessage = dict[str, tuple[str, dict[str, Any]]]
+
+
 async def _agent_stream(
     req: ChatRequest, agent: Any, thread_id: str, tracer: Any | None = None
 ) -> AsyncIterator[dict[str, str]]:
@@ -243,10 +252,14 @@ async def _agent_stream(
         # compile time: which trace a run belongs to is a property of the
         # request, and a graph compiled once in lifespan cannot know it.
         config["callbacks"] = tracer_callbacks(tracer)
+        # Omitted entirely when absent rather than passed as None: Langfuse logs
+        # "Propagated attribute 'metadata.ui_context' is None. Dropping value."
+        # on every request that has no UI context, which is most of them.
+        extras = {} if ui_context is None else {"ui_context": ui_context}
         config["metadata"] = trace_metadata(
             thread_id=thread_id,
             name="chat.fast_path",
-            ui_context=ui_context,
+            **extras,
         )
 
     # The client replays the whole history every turn and the checkpointer also
@@ -270,6 +283,7 @@ async def _agent_stream(
         # from three turns ago is actively misleading to the D4 cascade.
         graph_input["ui_context"] = ui_context
 
+    usage: UsageByMessage = {}
     try:
         async for mode, chunk_or_update in agent.astream(
             graph_input, config, stream_mode=["messages", "updates"]
@@ -281,12 +295,10 @@ async def _agent_stream(
                 # the tool's raw JSON is streamed to the user as if the model had
                 # written it. Filtering on langgraph_node would work today and
                 # break silently the first time a node is renamed.
-                if (
-                    isinstance(message, AIMessageChunk)
-                    and isinstance(message.content, str)
-                    and message.content
-                ):
-                    yield _event("token", {"text": message.content})
+                if isinstance(message, AIMessageChunk):
+                    _record_usage(usage, message)
+                    if isinstance(message.content, str) and message.content:
+                        yield _event("token", {"text": message.content})
             else:
                 for node, update in chunk_or_update.items():
                     for event in _tool_events(node, update):
@@ -296,6 +308,70 @@ async def _agent_stream(
         # No `done` after an `error`. The client treats a missing `done` as
         # truncation; sending both would make a failure look like a clean stop.
         yield _event("error", {"message": _public_error(exc)})
+    finally:
+        # In `finally` because a turn that errored out, or was abandoned by the
+        # client, still spent tokens. That is precisely when the cost is most
+        # worth seeing.
+        _log_turn_cost(usage, thread_id)
+
+
+def _record_usage(usage: UsageByMessage, message: AIMessageChunk) -> None:
+    if not message.usage_metadata:
+        return
+    model = str((message.response_metadata or {}).get("model_name") or "")
+    # `model_name` is what the provider says served the request, which is not
+    # necessarily what we asked for -- DeepSeek accepts retired aliases and
+    # routes them elsewhere. Pricing the requested name would hide that.
+    if message.id is None:
+        # Only reached if a provider streams no ids at all. Each usage-bearing
+        # chunk then counts as its own generation, which over-counts if one
+        # generation reports usage twice. Over-counting is the safe direction
+        # for something whose job is to warn you about spend.
+        usage[f"<no-id:{len(usage)}>"] = (model, dict(message.usage_metadata))
+    else:
+        usage[message.id] = (model, dict(message.usage_metadata))
+
+
+def _log_turn_cost(usage: UsageByMessage, thread_id: str) -> None:
+    """One log line per turn: what it cost, and what it was made of.
+
+    Langfuse cannot answer this. Its managed price table has no DeepSeek entry,
+    and even a hand-written one cannot express peak/off-peak rates -- so the
+    dashboard shows $0.00 for real work. `paper_agent.pricing` explains both.
+
+    Absent usage is reported as unknown rather than as zero, for the same
+    reason: a cost of 0 must mean "this was free", never "we could not tell".
+    """
+    if not usage:
+        logger.info("turn %s: provider reported no token usage; cost unknown", thread_id)
+        return
+
+    now = datetime.now(UTC)
+    # Grouped by (model, peak) rather than listed per generation: a tool-calling
+    # turn runs the same model twice, and "deepseek-flash=$0.00026,
+    # deepseek-flash=$0.00011" reads like a bug. The peak flag stays in the key so
+    # a turn straddling 04:00 or 10:00 UTC still reports its two rates separately.
+    totals: dict[tuple[str, bool], Decimal] = {}
+    unpriced = 0
+    for model, meta in usage.values():
+        try:
+            cost = cost_of(model, meta, at=now)
+        except UnknownModelError:
+            logger.warning("turn %s: no price entry for model %r", thread_id, model)
+            unpriced += 1
+            continue
+        key = (model or "<unknown>", cost.peak)
+        totals[key] = totals.get(key, Decimal(0)) + cost.usd
+
+    if not totals:
+        logger.warning("turn %s: no priced model calls; cost unknown", thread_id)
+        return
+    total = sum(totals.values(), Decimal(0))
+    parts = [
+        f"{name}={format_usd(usd)}{'@peak' if peak else ''}" for (name, peak), usd in totals.items()
+    ]
+    suffix = f" + {unpriced} unpriced" if unpriced else ""
+    logger.info("turn %s cost %s%s (%s)", thread_id, format_usd(total), suffix, ", ".join(parts))
 
 
 def get_agent(request: Request) -> Any:

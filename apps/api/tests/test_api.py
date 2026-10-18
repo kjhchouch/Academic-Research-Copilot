@@ -15,8 +15,10 @@ and the checkpointer handshake are all exercised — only the LLM call is fake.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -516,6 +518,207 @@ def test_chat_error_event_is_not_followed_by_done() -> None:
     assert payload["message"] == "upstream error (RuntimeError)"
     assert "sk-secret" not in payload["message"]
     assert "deepseek.com" not in payload["message"]
+
+
+# --------------------------------------------------------------------------- #
+# Per-turn cost
+# --------------------------------------------------------------------------- #
+
+
+class _FrozenDatetime:
+    """Pins `datetime.now(UTC)` so a cost assertion is not hour-dependent.
+
+    DeepSeek's peak rate is exactly 2x off-peak, so a test reading the real
+    clock would pass at noon and fail at 02:00 UTC on a weekday.
+    """
+
+    fixed = datetime(2026, 10, 19, 12, 0, tzinfo=UTC)  # a Monday noon: off-peak
+
+    @classmethod
+    def now(cls, tz: object = None) -> datetime:
+        return cls.fixed
+
+
+# 600 billable at the cache-miss rate + 400 at the hit rate + 200 output,
+# off-peak deepseek-flash: (600*0.15 + 400*0.003 + 200*0.60) / 1e6
+USAGE: dict[str, Any] = {
+    "input_tokens": 1000,
+    "output_tokens": 200,
+    "total_tokens": 1200,
+    "input_token_details": {"cache_read": 400},
+}
+EXPECTED_COST = "$0.000211"
+
+
+class _PricedAgent:
+    """Streams the way DeepSeek does: usage arrives on the final chunk only."""
+
+    def __init__(self, *, model: str = "deepseek-flash", explode: bool = False) -> None:
+        self.model = model
+        self.explode = explode
+
+    async def aget_state(self, config: dict) -> None:
+        return None
+
+    async def astream(self, *_args: object, **_kwargs: object) -> Any:
+        yield ("messages", (AIMessageChunk(id="g1", content="答"), {}))
+        # Two usage-bearing chunks for one generation: the running total is
+        # repeated, not incremented. Summing them would over-report the cost.
+        partial: dict[str, Any] = {
+            "input_tokens": 400,
+            "output_tokens": 0,
+            "total_tokens": 400,
+            "input_token_details": {"cache_read": 400},
+        }
+        for usage in (partial, USAGE):
+            yield (
+                "messages",
+                (
+                    AIMessageChunk(
+                        id="g1",
+                        content="",
+                        usage_metadata=usage,
+                        response_metadata={"model_name": self.model},
+                    ),
+                    {},
+                ),
+            )
+        if self.explode:
+            raise RuntimeError("upstream 500")
+
+
+class _TwoGenerationAgent:
+    """A tool-calling turn runs the model twice, under two different ids."""
+
+    def __init__(self, models: tuple[str, str] = ("deepseek-flash", "deepseek-v4-pro")) -> None:
+        self.models = models
+
+    async def aget_state(self, config: dict) -> None:
+        return None
+
+    async def astream(self, *_args: object, **_kwargs: object) -> Any:
+        for gen_id, model in zip(("g1", "g2"), self.models, strict=True):
+            yield (
+                "messages",
+                (
+                    AIMessageChunk(
+                        id=gen_id,
+                        content="",
+                        usage_metadata=USAGE,
+                        response_metadata={"model_name": model},
+                    ),
+                    {},
+                ),
+            )
+
+
+@pytest.fixture
+def cost_log(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[pytest.LogCaptureFixture]:
+    monkeypatch.setattr(chat_route, "datetime", _FrozenDatetime)
+    caplog.set_level(logging.INFO, logger="api.routes.chat")
+    yield caplog
+
+
+def test_chat_logs_what_the_turn_cost(cost_log: pytest.LogCaptureFixture) -> None:
+    """The number Langfuse cannot produce: its price table has no DeepSeek entry,
+    and a hand-written one still could not express peak vs off-peak.
+    """
+    app.dependency_overrides[chat_route.get_agent] = lambda: _PricedAgent()
+    events = stream(user_msg("数一下这段有多少字"))
+    assert events[-1][0] == "done"
+
+    messages = [r.getMessage() for r in cost_log.records]
+    line = next(m for m in messages if " cost " in m)
+    assert f"cost {EXPECTED_COST}" in line
+    assert f"deepseek-flash={EXPECTED_COST}" in line
+    assert "@peak" not in line  # frozen at off-peak
+
+
+def test_cumulative_chunks_are_not_summed(cost_log: pytest.LogCaptureFixture) -> None:
+    """A streamed generation repeats its running total on every chunk.
+
+    Summing instead of keying by message id would multiply the cost by the number
+    of chunks -- the single most likely way to make this feature lie.
+    """
+    app.dependency_overrides[chat_route.get_agent] = lambda: _PricedAgent()
+    stream(user_msg("hi"))
+    line = next(m for m in (r.getMessage() for r in cost_log.records) if " cost " in m)
+    assert line.count(EXPECTED_COST) == 2  # the total and the one per-model part
+    assert f"cost {EXPECTED_COST} (" in line
+
+
+def test_two_generations_in_one_turn_are_both_counted(cost_log: pytest.LogCaptureFixture) -> None:
+    """Keying by message id must not collapse distinct generations either.
+
+    A tool-calling turn runs the model twice; the second call is the expensive
+    one here, and it is the one that would go missing.
+    """
+    app.dependency_overrides[chat_route.get_agent] = lambda: _TwoGenerationAgent()
+    events = stream(user_msg("hi"))
+    assert events[-1][0] == "done"
+
+    line = next(m for m in (r.getMessage() for r in cost_log.records) if " cost " in m)
+    assert "cost $0.001012" in line
+    assert "deepseek-flash=$0.000211" in line
+    assert "deepseek-v4-pro=$0.000801" in line
+
+
+def test_two_calls_to_the_same_model_collapse_into_one_line(
+    cost_log: pytest.LogCaptureFixture,
+) -> None:
+    """The real shape of a tool-calling turn: one model, two generations.
+
+    Listed separately it reads as `deepseek-flash=$0.000211,
+    deepseek-flash=$0.000211`, which looks like a double-count bug. The total is
+    what matters; the split only earns its place when the models differ.
+    """
+    app.dependency_overrides[chat_route.get_agent] = lambda: _TwoGenerationAgent(
+        ("deepseek-flash", "deepseek-flash")
+    )
+    stream(user_msg("hi"))
+
+    line = next(m for m in (r.getMessage() for r in cost_log.records) if " cost " in m)
+    assert "cost $0.000422 (deepseek-flash=$0.000422)" in line
+    assert line.count("deepseek-flash=") == 1
+
+
+def test_missing_usage_is_reported_as_unknown_not_zero(
+    cost_log: pytest.LogCaptureFixture,
+) -> None:
+    """The default stub reports no usage. That must not read as a free turn."""
+    stream(user_msg("hi"))
+    messages = [r.getMessage() for r in cost_log.records]
+    assert any("provider reported no token usage; cost unknown" in m for m in messages)
+    assert not any("$0" in m for m in messages)
+
+
+def test_an_unpriced_model_warns_without_breaking_the_stream(
+    cost_log: pytest.LogCaptureFixture,
+) -> None:
+    """UnknownModelError is caught here on purpose: a missing price row is a
+    reporting gap, and it must never take down a user's request.
+    """
+    app.dependency_overrides[chat_route.get_agent] = lambda: _PricedAgent(model="gpt-5")
+    events = stream(user_msg("hi"))
+    assert events[-1][0] == "done"
+
+    messages = [r.getMessage() for r in cost_log.records]
+    assert any("no price entry for model 'gpt-5'" in m for m in messages)
+    assert any("no priced model calls; cost unknown" in m for m in messages)
+
+
+def test_a_failed_turn_still_reports_its_cost(cost_log: pytest.LogCaptureFixture) -> None:
+    """Cost is logged in a `finally`: an upstream 500 or a client that navigates
+    away still spent tokens, and that is when the number matters most.
+    """
+    app.dependency_overrides[chat_route.get_agent] = lambda: _PricedAgent(explode=True)
+    events = stream(user_msg("hi"))
+    assert events[-1][0] == "error"
+
+    line = next(m for m in (r.getMessage() for r in cost_log.records) if " cost " in m)
+    assert f"cost {EXPECTED_COST}" in line
 
 
 def test_chat_returns_503_when_no_graph_is_configured(
