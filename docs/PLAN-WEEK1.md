@@ -342,6 +342,13 @@ class Citation(BaseModel):
 ```
 让 LLM 在正文里输出 `[1]` 形式的标记，同时返回 citations 数组。**不要把引用信息塞在文本里让前端正则解析** —— Week 2 做 span 级校验时会彻底重写。
 
+> **D6 实测偏差**：三处，都朝「引用不可能凭空捏造」的方向改。
+> ① `citation_id` 是 **`int`** 不是 `str`——网关按检索工具真实返回的顺序从 1 递增分配，前端 `[1]` 直接拿数字对齐，无需解析字符串。
+> ② 不让 LLM「返回 citations 数组」。数组是**幻觉面**：模型可以写一个从没检索过的条目。改成**grounding by construction**——网关在 `bind_citations` 包装的工具返回里，把分配的 `citation_id` 注进每条 paper（`citations.py`，per-request `ContextVar` 绑定 registry），系统提示词要求「citation_id 是 3 就写 `[3]`，不要自己重新编号」。模型只能**复制**它拿到过的 id；写 `[7]` 而 registry 无 7，前端就渲染成普通文本，不成为 chip。
+> ③ citations 不走正文文本，走**独立的 `citation` SSE 事件**（网关在每个 `updates` chunk 后排空 registry 新增项），前端落成 `data-citation` message part（按消息 scope，因为 id 每轮从 1 重开）。正文里只有 `[n]` 锚点，前端 `textWithChips` 正则 `\[(\d+)\]` 命中且有对应 part 才渲染 chip——「不要塞在文本里让前端正则解析」这条纪律**对引用元数据成立**，正则只碰 `[n]` 这个锚点本身。
+>
+> ✅ 验收的后端半程已用**假检索工具在真编译图里端到端跑通**（`test_api.py::test_chat_emits_citation_events_from_what_the_tool_returned`：citation 事件带 [1][2]、DOI、authors，`span` 恒为 null 占位）。**真论文的浏览器画面仍卡在 OpenAlex 无 key 预算**（同 D5，见坑 17）——D7 录像前必须先解这条：等 UTC 午夜重置或配 `OPENALEX_API_KEY`。
+
 **前端**（你的主场，但**严格控制在 1 天内**）
 - 引用标记 `[1]` 渲染成可点击的 chip
 - 悬浮显示 title + abstract 预览
