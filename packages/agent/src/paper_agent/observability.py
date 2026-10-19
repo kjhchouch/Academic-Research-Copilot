@@ -155,10 +155,41 @@ def trace_metadata(
     return metadata
 
 
+# Managers we have already shut down, keyed by id() and holding a strong
+# reference to the manager itself. The strong ref is the point: it keeps the
+# object alive so its id() can never be recycled onto a different manager after
+# GC, which would let the guard skip a shutdown it should have run. Bounded by
+# the number of distinct Langfuse public keys in one process -- one, here.
+_SHUT_DOWN_MANAGERS: dict[int, object] = {}
+
+
 def shutdown_tracer(client: Any | None) -> None:
-    """Flush and release. Safe to call with None, and safe to call twice."""
+    """Flush and release the process-wide tracer. Safe to call with None.
+
+    Runs at most once per underlying resource manager, and that guard is
+    load-bearing rather than tidy. Langfuse's `LangfuseResourceManager` is a
+    process-global singleton keyed by public_key (verified: two `Langfuse(...)`
+    clients built with one key return `a._resources is b._resources == True`).
+    Its `shutdown()` stops the consumer threads, and its `flush()` ends in
+    `_score_queue.join()` -- so a *second* shutdown of the same manager blocks
+    forever on a queue whose consumers are already dead. `client.shutdown()`
+    cannot raise its way out of a join, and neither can our `except`.
+
+    This is not hypothetical. The api test suite runs several full app lifespans
+    in one process; before this guard the second teardown hung the whole run in
+    `queue.join()`. Keyed on the manager's identity, not the client's, because
+    distinct clients share one manager. `_resources` is private; if a future
+    Langfuse drops it, `getattr` falls back to the client and the guard degrades
+    to per-client -- still correct for a single client, just narrower.
+    """
     if client is None:
         return
+    manager = getattr(client, "_resources", client)
+    key = id(manager)
+    if key in _SHUT_DOWN_MANAGERS:
+        logger.debug("langfuse resource manager already shut down; skipping")
+        return
+    _SHUT_DOWN_MANAGERS[key] = manager
     try:
         client.shutdown()
     except Exception as exc:  # noqa: BLE001 - shutdown must not mask the real error

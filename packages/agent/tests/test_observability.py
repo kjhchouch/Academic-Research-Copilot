@@ -95,6 +95,50 @@ def test_shutdown_tracer_tolerates_none_and_failure() -> None:
     assert client.shutdown_calls == 1
 
 
+class _Manager:
+    """Stands in for Langfuse's per-public-key `LangfuseResourceManager`."""
+
+
+class _CountingClient:
+    """A client that shares its `_resources` manager, like two `Langfuse(...)`
+    objects built with one public_key do."""
+
+    def __init__(self, manager: object) -> None:
+        self._resources = manager
+        self.shutdown_calls = 0
+
+    def shutdown(self) -> None:
+        self.shutdown_calls += 1
+
+
+def test_shutdown_runs_once_per_shared_resource_manager() -> None:
+    """The guard keys on the manager, not the client.
+
+    Two clients share one manager here, exactly as two `Langfuse(...)` with one
+    public_key do. The manager's second `shutdown()` would block forever in
+    `_score_queue.join()` once its consumers are dead, so the second client --
+    a different object, same manager -- must be skipped.
+    """
+    manager = _Manager()
+    first = _CountingClient(manager)
+    second = _CountingClient(manager)
+    shutdown_tracer(first)
+    shutdown_tracer(second)
+    assert first.shutdown_calls == 1
+    assert second.shutdown_calls == 0
+
+
+def test_shutdown_runs_once_per_distinct_resource_manager() -> None:
+    """Distinct managers are independent, so the guard is not merely a global
+    'shut down once' -- two public keys each get their one shutdown."""
+    a = _CountingClient(_Manager())
+    b = _CountingClient(_Manager())
+    shutdown_tracer(a)
+    shutdown_tracer(b)
+    assert a.shutdown_calls == 1
+    assert b.shutdown_calls == 1
+
+
 # --------------------------------------------------------------------------- #
 # Verification is advisory, never fatal
 # --------------------------------------------------------------------------- #
