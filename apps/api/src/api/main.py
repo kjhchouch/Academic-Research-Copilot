@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -44,6 +45,14 @@ def _build_graph(checkpointer: object) -> object | None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # uvicorn configures only its own three loggers and never touches root, so our
+    # records fall through to logging.lastResort -- level WARNING. The failure is
+    # silent and asymmetric: INFO (the cost line, "langfuse credentials accepted")
+    # vanishes while warnings still print. In lifespan, not at import, so that a
+    # test importing api.main does not reconfigure root for the whole pytest run.
+    logging.basicConfig(
+        stream=sys.stderr, level=logging.INFO, format="%(levelname)s %(name)s: %(message)s"
+    )
     # Built here rather than at import time so a misconfigured backend fails
     # loudly at startup instead of on the first request.
     app.state.cache = make_cache(settings.cache_backend, settings.redis_url)
