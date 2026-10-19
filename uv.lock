@@ -946,6 +946,7 @@ dependencies = [
     { name = "langfuse" },
     { name = "langgraph" },
     { name = "langgraph-checkpoint-sqlite" },
+    { name = "mcp" },
     { name = "pydantic" },
     { name = "typesafe-sdk" },
 ]
@@ -964,6 +965,7 @@ requires-dist = [
     { name = "langfuse", specifier = ">=5" },
     { name = "langgraph", specifier = ">=1.2.15" },
     { name = "langgraph-checkpoint-sqlite", specifier = ">=3.1.2" },
+    { name = "mcp", specifier = ">=2.3.0" },
     { name = "pydantic", specifier = ">=2.9" },
     { name = "typesafe-sdk", specifier = ">=0.7.5" },
 ]

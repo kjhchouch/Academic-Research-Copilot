@@ -20,12 +20,19 @@ dependencies = [
     # loudly, at least, rather than silently tracing nothing.
     "langfuse>=5",
     "typesafe-sdk>=0.7.5",
+    # D6: tools/mcp.py adapts an MCP server's tools into LangChain tools. Not
+    # mcp[cli] -- the agent is a client and never runs `mcp dev`; the CLI extra
+    # exists for the server package, which declares it itself.
+    #
+    # >=2.3 rather than >=1: the bridge uses mcp.client.Client, and 1.x has no
+    # such class (its client was `stdio_client` + ClientSession). Same reason
+    # langchain-mcp-adapters cannot be used here -- it pins mcp<2.0.0.
+    "mcp>=2.3.0",
 ]
 
 # langgraph-checkpoint-postgres deliberately NOT added: retrieval and
 # checkpointing both settled on SQLite (see README "开发计划" and devlog 坑 11).
 # Add it in Week 4 if deployment actually needs Postgres.
-# D5 adds: mcp[cli]
 
 [dependency-groups]
 dev = [
