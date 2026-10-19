@@ -300,12 +300,27 @@ uv add "mcp[cli]"
 | `get_paper(paper_id)` | Semantic Scholar | 详情 + 参考文献列表 |
 | `format_citation(doi, style)` | 自己写或 citeproc | style: `apa` / `ieee` / `gb-t-7714` |
 
-**调试**：用 MCP Inspector（`uvx @modelcontextprotocol/inspector`）单独测 server，别在 agent 里边调边猜。
+> **D5 实测偏差**：`get_paper` 改成**按标识符形状路由**——DOI 和 `W...` 走 OpenAlex，`CorpusId:` / `ArXiv:` / 40 位 hex 才走 Semantic Scholar。原因是**无 key 的 S2 第一个请求就 429**，而 D5 没申请 key；OpenAlex 单家就能满足「详情 + 参考文献列表」（`referenced_works` 再用 `filter=openalex_id:A|B|C` 批量解析成标题）。`format_citation` 走「自己写」：CSL 生态对 GB/T 7714 覆盖很差，而那正是本产品最需要的一个。
+
+**调试**：用 MCP Inspector 单独测 server，别在 agent 里边调边猜。
+
+```bash
+# inspector 是 npm 包，不是 Python 工具，所以是 npx 不是 uvx（原计划这里写错了）
+npx @modelcontextprotocol/inspector
+```
+
+Inspector 里填的 stdio 命令是 `literature-search`（`uv sync --all-packages` 后在 `.venv/Scripts/`），或者 `python -m mcp_literature_search`——后者不依赖 venv 的 Scripts 目录在 PATH 上，写进客户端配置更稳。
+
+> `mcp[cli]` 自带 `mcp dev <file_spec>`，源码里就是 `npx @modelcontextprotocol/inspector` + `uv run mcp run <file_spec>` 的组合。它要一个**模块级 server 对象**，而本项目是 `build_server()` 工厂构造的（settings 和 transport 都要能注入才能离线测），所以没有这样的对象。**D5 没有实跑过 `mcp dev`**（它会 npx 装第三方包），要用得先在模块里暴露一个 `server = build_server()`，或者直接用 Inspector 手填 stdio 命令。
 
 > ⚠️ **本周最大的坑在这里**：MCP server 用 stdio 传输时，**stdout 是协议通道**。任何 `print()` 都会破坏 JSON-RPC 流，表现为 agent 侧莫名的连接错误或解析失败。
 > **所有日志必须走 `logging` 到 stderr 或文件**，并且第一件事就是配好 `logging.basicConfig(stream=sys.stderr)`。
+>
+> **D5 实测补充**：mcp 2.x 的 `stdio_server()` 自己挡了一半——服务期间把 fd 1 指到 stderr，并**显式把 wire 重新包成 UTF-8**（源码注释：「the std handles' platform encodings are unreliable」），所以 GBK 控制台下中文描述是安全的。另一处要知道：`MCPServer.__init__` 会往 root logger 挂 RichHandler，但写的是 **stderr** 且尊重已有 handler，所以先 `basicConfig` 就能拿到一种可预期的格式。**纪律照旧**——这是 2.x 的行为，1.x 没有。回归测试是 `tests/test_stdio_purity.py`：起真子进程，断言 stdout 每一行都是合法 JSON-RPC。
 
 > ✅ **验收**：Inspector 里调 `search_papers("contrastive learning")` 返回 5 条真实论文，含有效 DOI。
+>
+> **D5 状态**：**离线等价验收已通过**——真子进程 + 真 stdio 管道 + 本地 `127.0.0.1` 假上游 + 真实抓取的 fixture，返回 `Contrastive Learning for Sequential Recommendation`（2022，DOI `10.1109/icde53745.2022.00099`）。**live 那条挂起**：OpenAlex 无 key 预算是 $0.10/天且按出口 IP 共享，本项目已耗尽两次，最后一次 `retryAfter: 66013`（≈18.3h，UTC 午夜重置）。要真跑一次，要么等重置要么配 `OPENALEX_API_KEY`。
 
 ---
 
