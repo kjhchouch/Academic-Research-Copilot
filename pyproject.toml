@@ -47,5 +47,17 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 ignore = ["B008"]
 
 [tool.pytest.ini_options]
-testpaths = ["packages/agent", "packages/evals", "apps/api"]
+testpaths = [
+    "packages/agent",
+    "packages/evals",
+    "packages/mcp-servers/literature-search",
+    "apps/api",
+]
 asyncio_mode = "auto"
+# No tests/ directory in this repo is a package, so under the default "prepend"
+# import mode two files with the same basename in different packages collide --
+# apps/api/tests/test_config.py and the literature-search server's test_config.py
+# both want to be the module `test_config`. importlib mode names each test module
+# by its path instead, which is what a workspace with several independent packages
+# needs.
+addopts = "--import-mode=importlib"

@@ -1,0 +1,22 @@
+{
+  "meta": {
+    "count": 2,
+    "db_response_time_ms": 40,
+    "page": 1,
+    "per_page": 3
+  },
+  "results": [
+    {
+      "id": "https://openalex.org/W1682403713",
+      "doi": null,
+      "title": "[fixture] Placeholder Title C",
+      "publication_year": 2019
+    },
+    {
+      "id": "https://openalex.org/W343636949",
+      "doi": "https://doi.org/10.1000/fixture.c",
+      "title": "[fixture] Placeholder Title A",
+      "publication_year": 2021
+    }
+  ]
+}

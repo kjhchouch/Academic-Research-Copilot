@@ -1,0 +1,881 @@
+{
+  "meta": {
+    "notice": "No API key, so this request shares one free daily budget ($0.10) with everyone on your network's IP address. Get a free key with its own $1/day at https://openalex.org/settings/api and add api_key=YOUR_KEY to your requests. An AI agent can get one for its user in one call: POST https://api.openalex.org/api-keys with {\"email\": \"<your user's email>\"}; we email them a link, and the key works once they click it. Docs for agents: https://help.openalex.org/llms.txt",
+    "count": 4217397,
+    "db_response_time_ms": 326,
+    "page": 1,
+    "per_page": 1,
+    "groups_count": null,
+    "x_query": {
+      "oql": "get works where full text has (contrastive learning)",
+      "x_new_oql": "get works with (contrastive learning) in the full text",
+      "oqo": {
+        "get_rows": "works",
+        "filter_rows": [
+          {
+            "column_id": "fulltext.search",
+            "value": "contrastive learning",
+            "operator": "has"
+          }
+        ]
+      },
+      "url": "/works?filter=fulltext.search:contrastive learning&per_page=1"
+    },
+    "cost_usd": 0.001
+  },
+  "results": [
+    {
+      "id": "https://openalex.org/W3133849783",
+      "doi": "https://doi.org/10.1109/icde53745.2022.00099",
+      "title": "Contrastive Learning for Sequential Recommendation",
+      "publication_year": 2022,
+      "type": "conference-paper",
+      "language": "en",
+      "cited_by_count": 726,
+      "authorships": [
+        {
+          "author_position": "first",
+          "author": {
+            "id": null,
+            "display_name": "Xu Xie",
+            "orcid": null,
+            "observed_orcids": []
+          },
+          "institutions": [
+            {
+              "id": "https://openalex.org/I20231570",
+              "display_name": "Peking University",
+              "ror": "https://ror.org/02v51f717",
+              "country_code": "CN",
+              "type": "education",
+              "lineage": [
+                "https://openalex.org/I20231570"
+              ]
+            }
+          ],
+          "countries": [
+            "CN"
+          ],
+          "is_corresponding": false,
+          "raw_author_name": "Xu Xie",
+          "raw_affiliation_strings": [
+            "School of Computer Science &#x0026; Key Laboratory of High Confidence Software Technologies (MOE), Peking University"
+          ],
+          "raw_orcid": null,
+          "affiliations": [
+            {
+              "raw_affiliation_string": "School of Computer Science &#x0026; Key Laboratory of High Confidence Software Technologies (MOE), Peking University",
+              "institution_ids": [
+                "https://openalex.org/I20231570"
+              ]
+            }
+          ]
+        },
+        {
+          "author_position": "middle",
+          "author": {
+            "id": "https://openalex.org/A5101467161",
+            "display_name": "Fei Sun",
+            "orcid": "https://orcid.org/0000-0002-6146-148X",
+            "observed_orcids": [
+              "https://orcid.org/0000-0002-6146-148X"
+            ]
+          },
+          "institutions": [
+            {
+              "id": "https://openalex.org/I45928872",
+              "display_name": "Alibaba Group (China)",
+              "ror": "https://ror.org/00k642b80",
+              "country_code": "CN",
+              "type": "company",
+              "lineage": [
+                "https://openalex.org/I45928872"
+              ]
+            }
+          ],
+          "countries": [
+            "CN"
+          ],
+          "is_corresponding": false,
+          "raw_author_name": "Fei Sun",
+          "raw_affiliation_strings": [
+            "Alibaba Group,China",
+            "Alibaba Group, China"
+          ],
+          "raw_orcid": null,
+          "affiliations": [
+            {
+              "raw_affiliation_string": "Alibaba Group,China",
+              "institution_ids": [
+                "https://openalex.org/I45928872"
+              ]
+            },
+            {
+              "raw_affiliation_string": "Alibaba Group, China",
+              "institution_ids": [
+                "https://openalex.org/I45928872"
+              ]
+            }
+          ]
+        },
+        {
+          "author_position": "middle",
+          "author": {
+            "id": null,
+            "display_name": "Zhaoyang Liu",
+            "orcid": null,
+            "observed_orcids": []
+          },
+          "institutions": [
+            {
+              "id": "https://openalex.org/I45928872",
+              "display_name": "Alibaba Group (China)",
+              "ror": "https://ror.org/00k642b80",
+              "country_code": "CN",
+              "type": "company",
+              "lineage": [
+                "https://openalex.org/I45928872"
+              ]
+            }
+          ],
+          "countries": [
+            "CN"
+          ],
+          "is_corresponding": false,
+          "raw_author_name": "Zhaoyang Liu",
+          "raw_affiliation_strings": [
+            "Alibaba Group,China",
+            "Alibaba Group, China"
+          ],
+          "raw_orcid": null,
+          "affiliations": [
+            {
+              "raw_affiliation_string": "Alibaba Group,China",
+              "institution_ids": [
+                "https://openalex.org/I45928872"
+              ]
+            },
+            {
+              "raw_affiliation_string": "Alibaba Group, China",
+              "institution_ids": [
+                "https://openalex.org/I45928872"
+              ]
+            }
+          ]
+        },
+        {
+          "author_position": "middle",
+          "author": {
+            "id": "https://openalex.org/A5021674757",
+            "display_name": "Shiwen Wu",
+            "orcid": "https://orcid.org/0000-0003-1072-7222",
+            "observed_orcids": [
+              "https://orcid.org/0000-0003-1072-7222"
+            ]
+          },
+          "institutions": [
+            {
+              "id": "https://openalex.org/I20231570",
+              "display_name": "Peking University",
+              "ror": "https://ror.org/02v51f717",
+              "country_code": "CN",
+              "type": "education",
+              "lineage": [
+                "https://openalex.org/I20231570"
+              ]
+            }
+          ],
+          "countries": [
+            "CN"
+          ],
+          "is_corresponding": false,
+          "raw_author_name": "Shiwen Wu",
+          "raw_affiliation_strings": [
+            "School of Computer Science &#x0026; Key Laboratory of High Confidence Software Technologies (MOE), Peking University"
+          ],
+          "raw_orcid": null,
+          "affiliations": [
+            {
+              "raw_affiliation_string": "School of Computer Science &#x0026; Key Laboratory of High Confidence Software Technologies (MOE), Peking University",
+              "institution_ids": [
+                "https://openalex.org/I20231570"
+              ]
+            }
+          ]
+        },
+        {
+          "author_position": "middle",
+          "author": {
+            "id": "https://openalex.org/A5101403129",
+            "display_name": "Jinyang Gao",
+            "orcid": "https://orcid.org/0000-0002-2094-3554",
+            "observed_orcids": [
+              "https://orcid.org/0000-0002-2094-3554"
+            ]
+          },
+          "institutions": [
+            {
+              "id": "https://openalex.org/I45928872",
+              "display_name": "Alibaba Group (China)",
+              "ror": "https://ror.org/00k642b80",
+              "country_code": "CN",
+              "type": "company",
+              "lineage": [
+                "https://openalex.org/I45928872"
+              ]
+            }
+          ],
+          "countries": [
+            "CN"
+          ],
+          "is_corresponding": false,
+          "raw_author_name": "Jinyang Gao",
+          "raw_affiliation_strings": [
+            "Alibaba Group,China",
+            "Alibaba Group, China"
+          ],
+          "raw_orcid": null,
+          "affiliations": [
+            {
+              "raw_affiliation_string": "Alibaba Group,China",
+              "institution_ids": [
+                "https://openalex.org/I45928872"
+              ]
+            },
+            {
+              "raw_affiliation_string": "Alibaba Group, China",
+              "institution_ids": [
+                "https://openalex.org/I45928872"
+              ]
+            }
+          ]
+        },
+        {
+          "author_position": "middle",
+          "author": {
+            "id": "https://openalex.org/A5004837183",
+            "display_name": "Jiandong Zhang",
+            "orcid": "https://orcid.org/0000-0003-3404-1559",
+            "observed_orcids": [
+              "https://orcid.org/0000-0003-3404-1559"
+            ]
+          },
+          "institutions": [
+            {
+              "id": "https://openalex.org/I45928872",
+              "display_name": "Alibaba Group (China)",
+              "ror": "https://ror.org/00k642b80",
+              "country_code": "CN",
+              "type": "company",
+              "lineage": [
+                "https://openalex.org/I45928872"
+              ]
+            }
+          ],
+          "countries": [
+            "CN"
+          ],
+          "is_corresponding": false,
+          "raw_author_name": "Jiandong Zhang",
+          "raw_affiliation_strings": [
+            "Alibaba Group,China",
+            "Alibaba Group, China"
+          ],
+          "raw_orcid": null,
+          "affiliations": [
+            {
+              "raw_affiliation_string": "Alibaba Group,China",
+              "institution_ids": [
+                "https://openalex.org/I45928872"
+              ]
+            },
+            {
+              "raw_affiliation_string": "Alibaba Group, China",
+              "institution_ids": [
+                "https://openalex.org/I45928872"
+              ]
+            }
+          ]
+        },
+        {
+          "author_position": "middle",
+          "author": {
+            "id": "https://openalex.org/A5040297543",
+            "display_name": "Bolin Ding",
+            "orcid": "https://orcid.org/0000-0003-1535-9692",
+            "observed_orcids": [
+              "https://orcid.org/0000-0003-1535-9692"
+            ]
+          },
+          "institutions": [
+            {
+              "id": "https://openalex.org/I45928872",
+              "display_name": "Alibaba Group (China)",
+              "ror": "https://ror.org/00k642b80",
+              "country_code": "CN",
+              "type": "company",
+              "lineage": [
+                "https://openalex.org/I45928872"
+              ]
+            }
+          ],
+          "countries": [
+            "CN"
+          ],
+          "is_corresponding": false,
+          "raw_author_name": "Bolin Ding",
+          "raw_affiliation_strings": [
+            "Alibaba Group,China",
+            "Alibaba Group, China"
+          ],
+          "raw_orcid": null,
+          "affiliations": [
+            {
+              "raw_affiliation_string": "Alibaba Group,China",
+              "institution_ids": [
+                "https://openalex.org/I45928872"
+              ]
+            },
+            {
+              "raw_affiliation_string": "Alibaba Group, China",
+              "institution_ids": [
+                "https://openalex.org/I45928872"
+              ]
+            }
+          ]
+        },
+        {
+          "author_position": "last",
+          "author": {
+            "id": "https://openalex.org/A5062357883",
+            "display_name": "Bin Cui",
+            "orcid": "https://orcid.org/0000-0003-1681-4677",
+            "observed_orcids": [
+              "https://orcid.org/0000-0003-1681-4677",
+              "https://orcid.org/0000-0002-7240-005X"
+            ]
+          },
+          "institutions": [
+            {
+              "id": "https://openalex.org/I20231570",
+              "display_name": "Peking University",
+              "ror": "https://ror.org/02v51f717",
+              "country_code": "CN",
+              "type": "education",
+              "lineage": [
+                "https://openalex.org/I20231570"
+              ]
+            }
+          ],
+          "countries": [
+            "CN"
+          ],
+          "is_corresponding": false,
+          "raw_author_name": "Bin Cui",
+          "raw_affiliation_strings": [
+            "School of Computer Science &#x0026; Key Laboratory of High Confidence Software Technologies (MOE), Peking University",
+            "Center for Data Science, Peking University & National Engineering Laboratory for Big Data Analysis and Applications",
+            "Institute of Computational Social Science, Peking University(Qingdao), China"
+          ],
+          "raw_orcid": null,
+          "affiliations": [
+            {
+              "raw_affiliation_string": "School of Computer Science &#x0026; Key Laboratory of High Confidence Software Technologies (MOE), Peking University",
+              "institution_ids": [
+                "https://openalex.org/I20231570"
+              ]
+            },
+            {
+              "raw_affiliation_string": "Center for Data Science, Peking University & National Engineering Laboratory for Big Data Analysis and Applications",
+              "institution_ids": [
+                "https://openalex.org/I20231570"
+              ]
+            },
+            {
+              "raw_affiliation_string": "Institute of Computational Social Science, Peking University(Qingdao), China",
+              "institution_ids": [
+                "https://openalex.org/I20231570"
+              ]
+            }
+          ]
+        }
+      ],
+      "primary_location": {
+        "id": "doi:10.1109/icde53745.2022.00099",
+        "doi": "https://doi.org/10.1109/icde53745.2022.00099",
+        "is_oa": false,
+        "landing_page_url": "https://doi.org/10.1109/icde53745.2022.00099",
+        "pdf_url": null,
+        "source": {
+          "id": "https://openalex.org/S4210210321",
+          "display_name": "Proceedings - International Conference on Data Engineering",
+          "issn_l": "1084-4627",
+          "issn": [
+            "1084-4627",
+            "2375-0286"
+          ],
+          "is_oa": false,
+          "is_in_doaj": false,
+          "is_core": true,
+          "listed_in": [
+            "cwts-core",
+            "norway-2"
+          ],
+          "host_organization": "https://openalex.org/P4310319808",
+          "host_organization_name": "Institute of Electrical and Electronics Engineers",
+          "host_organization_lineage": [
+            "https://openalex.org/P4310319808"
+          ],
+          "host_organization_lineage_names": [
+            "Institute of Electrical and Electronics Engineers"
+          ],
+          "type": "conference"
+        },
+        "license": null,
+        "license_id": null,
+        "version": "publishedVersion",
+        "is_accepted": true,
+        "is_published": true,
+        "raw_source_name": "2022 IEEE 38th International Conference on Data Engineering (ICDE)",
+        "raw_type": "proceedings-article"
+      },
+      "biblio": {
+        "volume": null,
+        "issue": null,
+        "first_page": "1259",
+        "last_page": "1273"
+      },
+      "abstract_inverted_index": {
+        "Sequential": [
+          0,
+          91
+        ],
+        "recommendation": [
+          1
+        ],
+        "methods": [
+          2
+        ],
+        "play": [
+          3
+        ],
+        "a": [
+          4,
+          17,
+          83
+        ],
+        "crucial": [
+          5
+        ],
+        "role": [
+          6
+        ],
+        "in": [
+          7,
+          77
+        ],
+        "modern": [
+          8
+        ],
+        "recommender": [
+          9
+        ],
+        "systems": [
+          10
+        ],
+        "because": [
+          11
+        ],
+        "of": [
+          12,
+          45,
+          73,
+          99
+        ],
+        "their": [
+          13,
+          26
+        ],
+        "ability": [
+          14
+        ],
+        "to": [
+          15,
+          40,
+          61,
+          113,
+          146
+        ],
+        "capture": [
+          16
+        ],
+        "user's": [
+          18
+        ],
+        "dynamic": [
+          19
+        ],
+        "interest": [
+          20
+        ],
+        "from": [
+          21,
+          50,
+          117
+        ],
+        "her/his": [
+          22
+        ],
+        "historical": [
+          23
+        ],
+        "inter-actions.": [
+          24
+        ],
+        "Despite": [
+          25
+        ],
+        "success,": [
+          27
+        ],
+        "we": [
+          28,
+          81,
+          140
+        ],
+        "argue": [
+          29
+        ],
+        "that": [
+          30,
+          157
+        ],
+        "these": [
+          31
+        ],
+        "approaches": [
+          32,
+          145
+        ],
+        "usually": [
+          33,
+          48
+        ],
+        "rely": [
+          34
+        ],
+        "on": [
+          35,
+          152
+        ],
+        "the": [
+          36,
+          42,
+          51,
+          78,
+          100,
+          109,
+          118,
+          134
+        ],
+        "sequential": [
+          37
+        ],
+        "prediction": [
+          38,
+          104
+        ],
+        "task": [
+          39,
+          105
+        ],
+        "optimize": [
+          41
+        ],
+        "huge": [
+          43
+        ],
+        "amounts": [
+          44
+        ],
+        "parameters.": [
+          46
+        ],
+        "They": [
+          47
+        ],
+        "suffer": [
+          49
+        ],
+        "data": [
+          52,
+          143
+        ],
+        "sparsity": [
+          53
+        ],
+        "problem,": [
+          54
+        ],
+        "which": [
+          55
+        ],
+        "makes": [
+          56
+        ],
+        "it": [
+          57,
+          124
+        ],
+        "difficult": [
+          58
+        ],
+        "for": [
+          59,
+          90
+        ],
+        "them": [
+          60
+        ],
+        "learn": [
+          62
+        ],
+        "high-quality": [
+          63
+        ],
+        "user": [
+          64,
+          120,
+          129,
+          135,
+          168
+        ],
+        "representations.": [
+          65,
+          169
+        ],
+        "To": [
+          66
+        ],
+        "tackle": [
+          67
+        ],
+        "that,": [
+          68
+        ],
+        "inspired": [
+          69
+        ],
+        "by": [
+          70,
+          165
+        ],
+        "recent": [
+          71
+        ],
+        "advances": [
+          72
+        ],
+        "contrastive": [
+          74,
+          110
+        ],
+        "learning": [
+          75,
+          111
+        ],
+        "techniques": [
+          76
+        ],
+        "computer": [
+          79
+        ],
+        "vision,": [
+          80
+        ],
+        "propose": [
+          82,
+          141
+        ],
+        "novel": [
+          84
+        ],
+        "multi-task": [
+          85
+        ],
+        "framework": [
+          86,
+          112
+        ],
+        "called": [
+          87
+        ],
+        "Contrastive": [
+          88
+        ],
+        "Learning": [
+          89
+        ],
+        "Recommendation": [
+          92
+        ],
+        "(CL4SRec).": [
+          93
+        ],
+        "CL4SRec": [
+          94,
+          158
+        ],
+        "not": [
+          95
+        ],
+        "only": [
+          96
+        ],
+        "takes": [
+          97
+        ],
+        "advantage": [
+          98
+        ],
+        "traditional": [
+          101
+        ],
+        "next": [
+          102
+        ],
+        "item": [
+          103
+        ],
+        "but": [
+          106
+        ],
+        "also": [
+          107
+        ],
+        "utilizes": [
+          108
+        ],
+        "derive": [
+          114
+        ],
+        "self-supervision": [
+          115,
+          148
+        ],
+        "signals": [
+          116
+        ],
+        "original": [
+          119
+        ],
+        "behavior": [
+          121
+        ],
+        "sequences.": [
+          122
+        ],
+        "Therefore,": [
+          123
+        ],
+        "can": [
+          125
+        ],
+        "extract": [
+          126
+        ],
+        "more": [
+          127
+        ],
+        "meaningful": [
+          128
+        ],
+        "patterns": [
+          130
+        ],
+        "and": [
+          131
+        ],
+        "further": [
+          132
+        ],
+        "encode": [
+          133
+        ],
+        "representations": [
+          136
+        ],
+        "effectively.": [
+          137
+        ],
+        "In": [
+          138
+        ],
+        "addition,": [
+          139
+        ],
+        "three": [
+          142
+        ],
+        "augmentation": [
+          144
+        ],
+        "construct": [
+          147
+        ],
+        "signals.": [
+          149
+        ],
+        "Extensive": [
+          150
+        ],
+        "experiments": [
+          151
+        ],
+        "four": [
+          153
+        ],
+        "public": [
+          154
+        ],
+        "datasets": [
+          155
+        ],
+        "demonstrate": [
+          156
+        ],
+        "achieves": [
+          159
+        ],
+        "state-of-the-art": [
+          160
+        ],
+        "performance": [
+          161
+        ],
+        "over": [
+          162
+        ],
+        "existing": [
+          163
+        ],
+        "baselines": [
+          164
+        ],
+        "inferring": [
+          166
+        ],
+        "better": [
+          167
+        ]
+      },
+      "is_retracted": false,
+      "open_access": {
+        "is_oa": true,
+        "oa_status": "green",
+        "oa_url": "https://arxiv.org/pdf/2010.14395",
+        "any_repository_has_fulltext": true
+      }
+    }
+  ]
+}

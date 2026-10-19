@@ -3,9 +3,25 @@ name = "mcp-literature-search"
 version = "0.1.0"
 description = "MCP server: OpenAlex / Semantic Scholar search + CSL citation formatting"
 requires-python = ">=3.12,<3.13"
-dependencies = []
+dependencies = [
+    "httpx2>=2.10.0",
+    "mcp[cli]>=2.3.0",
+    # Direct dependency even though mcp pulls it in: models.py is the package's
+    # security boundary and it should not be importable only by courtesy of
+    # another project's dependency list.
+    "pydantic>=2.12.0",
+]
 
-# D5 adds: "mcp[cli]", httpx, citeproc-py (or hand-rolled CSL for the 3 styles)
+[project.scripts]
+# The command a stdio MCP client spawns. `python -m mcp_literature_search` also
+# works, for client configs that cannot rely on the venv's Scripts dir being on PATH.
+literature-search = "mcp_literature_search.server:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+]
 
 [build-system]
 requires = ["hatchling"]
