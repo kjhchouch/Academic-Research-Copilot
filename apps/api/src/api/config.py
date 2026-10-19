@@ -71,7 +71,20 @@ class Settings(BaseSettings):
     decision_model_backend: str = "jev"
     jev_timeout_ms: int = 800
 
+    # --- Literature MCP server -------------------------------------------
+    # These are forwarded into the literature-search child process, and they are
+    # the *only* thing that reaches it. `stdio_client` gives a spawned server
+    # twelve inherited platform variables (PATH, SYSTEMROOT, TEMP, ...) plus
+    # whatever we pass explicitly, so the LLM and Langfuse keys above stay in this
+    # process by construction. See paper_agent.tools.mcp.StdioServerSpec.
+    #
+    # Note the names have to match the child's own env var names exactly -- it
+    # reads OPENALEX_MAILTO / OPENALEX_API_KEY / SEMANTIC_SCHOLAR_API_KEY through
+    # mcp_literature_search.config.Settings.from_env, which knows nothing about
+    # pydantic-settings or our .env files.
+    literature_mcp_enabled: bool = True
     openalex_mailto: str | None = None
+    openalex_api_key: SecretStr | None = None
     semantic_scholar_api_key: SecretStr | None = None
 
 

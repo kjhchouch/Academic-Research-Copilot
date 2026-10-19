@@ -287,6 +287,105 @@ def test_tool_result_falls_back_to_a_plain_string() -> None:
     assert chat_route._result_of("[1, 2]") == [1, 2]
 
 
+# A literature-shaped tool result: two papers, the fields the Citation contract
+# surfaces. Standalone rather than from the D5 server so this test stays offline
+# and asserts the gateway's mapping, not the upstream's shape.
+_SEARCH_RESULT: dict[str, Any] = {
+    "query": "contrastive learning",
+    "count": 2,
+    "papers": [
+        {
+            "source": "openalex",
+            "title": "A Simple Framework for Contrastive Learning",
+            "authors": ["Chen", "Kornblith"],
+            "year": 2020,
+            "venue": "ICML",
+            "doi": "10.5555/simclr",
+            "abstract": "We present SimCLR…",
+        },
+        {
+            "source": "openalex",
+            "title": "Momentum Contrast for Unsupervised Learning",
+            "authors": ["He"],
+            "year": 2020,
+            "venue": "CVPR",
+            "doi": "10.1109/moco",
+            "abstract": None,
+        },
+    ],
+}
+
+
+def _search_tool() -> Any:
+    from langchain_core.tools import StructuredTool
+
+    async def search_papers(query: str) -> dict[str, Any]:
+        # A fresh copy per call: the wrapper injects citation_id in place, and a
+        # shared module dict would leak ids across tests.
+        return json.loads(json.dumps(_SEARCH_RESULT))
+
+    return StructuredTool(
+        name="search_papers",
+        description="检索学术论文",
+        coroutine=search_papers,
+        args_schema={
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    )
+
+
+def test_chat_emits_citation_events_from_what_the_tool_returned() -> None:
+    """The D6 grounding contract, end to end through the gateway.
+
+    A citation-bound search tool runs inside a real graph; the gateway must turn
+    the papers it returned into `citation` events whose `citation_id` matches the
+    number injected into the tool result the model saw. That the two agree is the
+    whole point: the model cites [1]/[2] because it was *given* those ids, and
+    the frontend maps [1]/[2] to these events.
+    """
+    from langgraph.checkpoint.memory import InMemorySaver
+    from paper_agent.citations import bind_citations
+
+    (tool,) = bind_citations([_search_tool()])
+    model = ScriptedChatModel(
+        responses=[
+            tool_call("search_papers", {"query": "contrastive learning"}, "call_1"),
+            AIMessage(content="两篇代表作见 [1] 和 [2]。"),
+        ]
+    )
+    graph = build_graph(model=model.bind_tools([tool]), tools=[tool], checkpointer=InMemorySaver())
+    app.dependency_overrides[chat_route.get_agent] = lambda: graph
+
+    events = stream(user_msg("找 contrastive learning 的代表作"))
+    citations = [json.loads(data) for name, data in events if name == "citation"]
+
+    assert [c["citation_id"] for c in citations] == [1, 2]
+    assert citations[0]["title"] == "A Simple Framework for Contrastive Learning"
+    assert citations[0]["doi"] == "10.5555/simclr"
+    assert citations[0]["authors"] == ["Chen", "Kornblith"]
+    # Reserved for Week 2, present and null now — a stable wire shape.
+    assert citations[0]["span"] is None
+    # The second paper has no abstract upstream; the field is still there.
+    assert citations[1]["abstract"] is None
+
+    # The ids the model was shown match the ids the frontend was given.
+    end = next(e for e in tool_events(events) if e["status"] == "end")
+    assert [p["citation_id"] for p in end["result"]["papers"]] == [1, 2]
+    assert tokens(events) == "两篇代表作见 [1] 和 [2]。"
+
+
+def test_a_turn_without_papers_emits_no_citation_events() -> None:
+    """count_words returns no papers, so a turn that only counts words must not
+    invent citation events. Emitted-when-present and silent-when-absent are the
+    two halves of the same contract; the frontend keys its reference panel off
+    `citation` and an empty panel is the correct result here."""
+    events = stream(user_msg("数一下这段有多少字"))
+    assert [name for name, _ in events if name == "citation"] == []
+    assert any(name == "tool" for name, _ in events)  # the tool still ran
+
+
 def test_chat_stream_sends_utf8_not_escaped() -> None:
     """ensure_ascii=False on the gateway side. The payload is Chinese, so the
     default would triple the byte count and make DevTools unreadable.
@@ -872,6 +971,157 @@ def test_lifespan_builds_every_backend() -> None:
         # None when no LLM key is configured; the attribute must still exist,
         # because /api/chat distinguishes "not configured" (503) from "broken".
         assert hasattr(app.state, "graph")
+
+
+def test_lifespan_spawns_the_literature_server_and_registers_its_tools() -> None:
+    """The D6 acceptance, at the level where the wiring actually happens.
+
+    A real subprocess: the bridge is built from a spec, so this covers the command
+    line, the environment forwarding and the handshake together — the three things
+    most likely to be wrong and the three that no in-process test can see. It costs
+    about half a second, which is cheap for the only test in the repo that proves
+    the gateway can reach its own tool server.
+    """
+    with TestClient(app) as c:
+        bridge = app.state.mcp
+        assert bridge is not None, "the literature server did not come up"
+        assert bridge.connected
+        assert bridge.tool_names == ["search_papers", "get_paper", "format_citation"]
+
+        reported = c.get("/health").json()["mcp"]
+        assert reported["connected"] is True
+        assert reported["tools"] == bridge.tool_names
+
+
+def test_health_reports_the_tool_server_even_when_nothing_is_connected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same shape connected or not, so a client never has to branch on absence.
+
+    Read through a bare TestClient, which never runs the lifespan. `app.state` is
+    deleted first because it is a module global and a lifespan test that ran
+    earlier leaves a closed bridge on it -- asserting the no-bridge path has to
+    actually take that path.
+    """
+    monkeypatch.delattr(app.state, "mcp", raising=False)
+    reported = client.get("/health").json()["mcp"]
+    assert reported == {
+        "enabled": get_settings().literature_mcp_enabled,
+        "server": "literature-search",
+        "connected": False,
+        "tools": [],
+    }
+
+
+def test_the_child_environment_carries_no_gateway_secret() -> None:
+    """The forwarding rule, asserted at the composition root.
+
+    `stdio_client` gives a spawned server twelve inherited platform variables plus
+    whatever the spec names, so this dict is the child's whole world. Everything in
+    it is a literature-upstream credential the child needs; nothing else may be,
+    because the child talks to the internet and logs to a stderr we forward. The
+    LLM key and the Langfuse keys are the ones that would hurt.
+    """
+    from api.main import _literature_spec
+    from pydantic import SecretStr
+
+    configured = get_settings().model_copy(
+        update={
+            "llm_api_key": SecretStr("sk-llm-must-not-travel"),
+            "langfuse_secret_key": SecretStr("sk-lf-must-not-travel"),
+            "langfuse_public_key": "pk-lf-must-not-travel",
+            "typesafe_api_key": SecretStr("ts-must-not-travel"),
+            "openalex_mailto": "me@example.org",
+            "openalex_api_key": SecretStr("oa-should-travel"),
+            "semantic_scholar_api_key": SecretStr("s2-should-travel"),
+        }
+    )
+    spec = _literature_spec(configured)
+
+    assert spec.env == {
+        "OPENALEX_MAILTO": "me@example.org",
+        "OPENALEX_API_KEY": "oa-should-travel",
+        "SEMANTIC_SCHOLAR_API_KEY": "s2-should-travel",
+    }
+    joined = json.dumps({"env": spec.env, "cmd": spec.command, "args": list(spec.args)})
+    for fragment in ("sk-llm-", "sk-lf-", "pk-lf-", "ts-must-not-travel"):
+        assert fragment not in joined
+
+
+def test_the_child_environment_omits_keys_that_are_not_set() -> None:
+    """An absent key must be absent, not an empty string.
+
+    The server's Settings.from_env treats "" as None, so this is not a bug today —
+    but passing an empty OPENALEX_API_KEY would look like a configured key in a
+    process listing, and the honest encoding of "not set" is "not there".
+    """
+    from api.main import _literature_spec
+
+    spec = _literature_spec(
+        get_settings().model_copy(
+            update={
+                "openalex_mailto": None,
+                "openalex_api_key": None,
+                "semantic_scholar_api_key": None,
+            }
+        )
+    )
+    assert spec.env == {}
+
+
+def test_lifespan_survives_a_literature_server_that_will_not_start(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A dead retrieval server degrades the agent; it does not take down the gateway.
+
+    Retrieval is the one capability that genuinely needs the network, so it is the
+    one that must not be able to stop the offline tools from working. The warning
+    and /health's `connected: false` are what keep this from looking like a model
+    that simply refuses to search.
+    """
+    import api.main as main_module
+
+    monkeypatch.setattr(
+        main_module,
+        "_literature_spec",
+        lambda _settings: main_module.StdioServerSpec(
+            name="literature-search", command="definitely-not-an-executable-1f2e3d"
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING), TestClient(main_module.app) as c:
+        assert app.state.mcp is None
+        assert c.get("/health").json()["mcp"]["connected"] is False
+        assert c.get("/health").status_code == 200
+    assert "continuing without literature tools" in caplog.text
+
+
+def test_literature_server_can_be_switched_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """LITERATURE_MCP_ENABLED=false means no subprocess at all.
+
+    Not the same as a failed spawn: nothing is attempted, so there is no traceback
+    in the log and no half-second of startup spent discovering a missing package.
+    Patched on the module's settings object because get_settings() is lru_cached
+    and api.main binds it at import time.
+    """
+    import api.main as main_module
+
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        main_module.settings.model_copy(update={"literature_mcp_enabled": False}),
+    )
+
+    def _refuse(*_a: object, **_k: object) -> None:
+        raise AssertionError("the bridge must not be constructed when disabled")
+
+    monkeypatch.setattr(main_module, "MCPToolBridge", _refuse)
+
+    with TestClient(main_module.app) as c:
+        assert app.state.mcp is None
+        reported = c.get("/health").json()["mcp"]
+        assert reported["enabled"] is False
+        assert reported["connected"] is False
 
 
 def test_lifespan_propagates_a_bad_backend(monkeypatch: pytest.MonkeyPatch) -> None:

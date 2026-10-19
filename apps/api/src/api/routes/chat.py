@@ -12,24 +12,26 @@ The gateway emits its own tiny event vocabulary rather than the Vercel AI SDK's
 
     event: token   data: {"text": "..."}     one text delta
     event: tool    data: {...}               a tool call started or finished
+    event: citation data: {...}              one paper the agent may cite as [n]
     event: done    data: {}                  stream finished cleanly
     event: error   data: {"message": "..."}  stream failed; no `done` follows
 
 `tool` carries `status: "start"` with `name`/`id`/`args`, or `status: "end"` with
 `name`/`id`/`result`. `result` is a JSON value, not a JSON string — see
-`_result_of`.
+`_result_of`. `citation` carries one `paper_agent.citations.Citation`: the
+gateway-assigned `citation_id` (the `[n]` anchor), the paper's metadata, and a
+`span` that is always null in Week 1 and reserved for Week 2 grounding.
 
 Why not just speak the SDK's protocol from Python: that format is an internal
 detail of a TypeScript package and it changes between releases. Keeping the
 wire format owned by this service means `apps/web` does the mapping once, in a
 typed custom transport that the compiler checks against the installed SDK.
 
-`route` and `citation` are not emitted yet and deliberately so. A protocol event
-carrying placeholder data is worse than no event: the frontend cannot tell a
-real value from a stub, and the first consumer written against the stub will
-encode its fakeness. `route` arrives with the D4 cascade, `citation` with Week 2
-grounding. The transport already ignores unknown event names, so adding them
-later needs no frontend change.
+`route` is not emitted yet and deliberately so. A protocol event carrying
+placeholder data is worse than no event: the frontend cannot tell a real value
+from a stub, and the first consumer written against the stub will encode its
+fakeness. `route` arrives with the D4 cascade. The transport already ignores
+unknown event names, so adding it later needs no frontend change.
 """
 
 from __future__ import annotations
@@ -44,6 +46,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from paper_agent.citations import Citation, CitationRegistry, bind_registry
 from paper_agent.graph import DEFAULT_RECURSION_LIMIT
 from paper_agent.observability import trace_metadata, tracer_callbacks
 from paper_agent.pricing import UnknownModelError, cost_of, format_usd
@@ -161,6 +164,18 @@ def _event(name: str, payload: dict[str, Any] | None = None) -> dict[str, str]:
     # ensure_ascii=False: the queries are Chinese, and \uXXXX escapes would
     # triple the byte count and make the stream unreadable in DevTools.
     return {"event": name, "data": json.dumps(payload or {}, ensure_ascii=False)}
+
+
+def _citation_payload(citation: Citation) -> dict[str, Any]:
+    """A citation as a wire dict, with a stable shape.
+
+    Every field is present and null when the upstream did not supply it --
+    including `span`, always null in Week 1. A stable shape is what lets the
+    frontend type the event once; dropping nulls would make `doi` sometimes
+    absent and sometimes present, which is a different and worse contract than
+    "doi is a string or null".
+    """
+    return citation.model_dump(mode="json")
 
 
 def _tool_events(node: str, update: dict[str, Any] | None) -> list[dict[str, str]]:
@@ -284,25 +299,43 @@ async def _agent_stream(
         graph_input["ui_context"] = ui_context
 
     usage: UsageByMessage = {}
+    registry = CitationRegistry()
+    cited = 0
     try:
-        async for mode, chunk_or_update in agent.astream(
-            graph_input, config, stream_mode=["messages", "updates"]
-        ):
-            if mode == "messages":
-                message, _meta = chunk_or_update
-                # Type, not node name. `stream_mode="messages"` also yields the
-                # ToolMessage produced by the tools node, and without this filter
-                # the tool's raw JSON is streamed to the user as if the model had
-                # written it. Filtering on langgraph_node would work today and
-                # break silently the first time a node is renamed.
-                if isinstance(message, AIMessageChunk):
-                    _record_usage(usage, message)
-                    if isinstance(message.content, str) and message.content:
-                        yield _event("token", {"text": message.content})
-            else:
-                for node, update in chunk_or_update.items():
-                    for event in _tool_events(node, update):
-                        yield event
+        # Bound for the whole stream so the citation wrappers deep inside the
+        # graph's ToolNode -- which were built once in lifespan and cannot close
+        # over per-request state -- find this turn's registry through the
+        # ContextVar. Reset in the context manager's finally, including on error
+        # or client abandonment.
+        with bind_registry(registry):
+            async for mode, chunk_or_update in agent.astream(
+                graph_input, config, stream_mode=["messages", "updates"]
+            ):
+                if mode == "messages":
+                    message, _meta = chunk_or_update
+                    # Type, not node name. `stream_mode="messages"` also yields the
+                    # ToolMessage produced by the tools node, and without this filter
+                    # the tool's raw JSON is streamed to the user as if the model had
+                    # written it. Filtering on langgraph_node would work today and
+                    # break silently the first time a node is renamed.
+                    if isinstance(message, AIMessageChunk):
+                        _record_usage(usage, message)
+                        if isinstance(message.content, str) and message.content:
+                            yield _event("token", {"text": message.content})
+                else:
+                    for node, update in chunk_or_update.items():
+                        for event in _tool_events(node, update):
+                            yield event
+                    # Drained after each node update, not once at the end: papers
+                    # are registered while the tools node runs, and emitting them
+                    # as they appear lets the frontend build its reference panel
+                    # progressively instead of all at once on `done`. `cited`
+                    # deduplicates across updates because the registry list only
+                    # ever grows, in assignment order.
+                    new = registry.citations[cited:]
+                    for citation in new:
+                        yield _event("citation", _citation_payload(citation))
+                    cited += len(new)
         yield _event("done")
     except Exception as exc:  # noqa: BLE001 - the stream must close with a reason
         # No `done` after an `error`. The client treats a missing `done` as

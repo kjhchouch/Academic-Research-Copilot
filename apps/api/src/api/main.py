@@ -5,20 +5,103 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from paper_agent.citations import bind_citations
 from paper_agent.graph import build_graph
 from paper_agent.llm import make_chat_model
 from paper_agent.observability import make_tracer, shutdown_tracer, verify_tracer
 from paper_agent.storage import make_blob_store, make_cache, make_checkpointer
-from paper_agent.tools import TOOLS
+from paper_agent.tools import (
+    TOOLS,
+    MCPBridgeError,
+    MCPToolBridge,
+    StdioServerSpec,
+    assert_unique_tool_names,
+)
 
-from api.config import get_settings
+from api.config import Settings, get_settings
 from api.routes import chat
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
+# `python -m <package>` rather than the `literature-search` console script: the
+# script only works if the venv's Scripts/ (or bin/) is on PATH, which is not true
+# of every way this gateway gets launched, and the failure would be a confusing
+# spawn error at startup. sys.executable is the interpreter already running us, so
+# it is also the one that has the workspace's editable installs.
+LITERATURE_SERVER_NAME = "literature-search"
+LITERATURE_SERVER_MODULE = "mcp_literature_search"
 
-def _build_graph(checkpointer: object) -> object | None:
+
+def _literature_spec(settings: Settings) -> StdioServerSpec:
+    """The child's command line and its entire environment.
+
+    Secrets are unwrapped here and nowhere else. Once they are plain strings in a
+    dict they could in principle be logged, so the dict is built at the point of
+    use and never passed anywhere that reports on itself -- `describe()` returns
+    the server name and the tool list, not the env.
+    """
+    env: dict[str, str] = {}
+    if settings.openalex_mailto:
+        env["OPENALEX_MAILTO"] = settings.openalex_mailto
+    if settings.openalex_api_key:
+        env["OPENALEX_API_KEY"] = settings.openalex_api_key.get_secret_value()
+    if settings.semantic_scholar_api_key:
+        env["SEMANTIC_SCHOLAR_API_KEY"] = settings.semantic_scholar_api_key.get_secret_value()
+    return StdioServerSpec(
+        name=LITERATURE_SERVER_NAME,
+        command=sys.executable,
+        args=["-m", LITERATURE_SERVER_MODULE],
+        env=env,
+    )
+
+
+def _mcp_health(app: FastAPI) -> dict[str, object]:
+    """/health's tool-server block.
+
+    Reports the same shape whether or not a bridge exists, so a client can read
+    `mcp.connected` without first working out whether the server was enabled. The
+    attribute is read defensively because /health answers before the lifespan has
+    run in a bare TestClient -- which is most of the api test suite.
+    """
+    bridge = getattr(app.state, "mcp", None)
+    described = (
+        bridge.describe()
+        if bridge is not None
+        else {"server": LITERATURE_SERVER_NAME, "connected": False, "tools": []}
+    )
+    return {"enabled": settings.literature_mcp_enabled, **described}
+
+
+async def _connect_literature(settings: Settings) -> MCPToolBridge | None:
+    """Connect the retrieval server, or return None and carry on without it.
+
+    None is a degraded-but-running outcome, not a swallowed error, and it follows
+    the rule the tracer already set: the product boots with zero external
+    services. Retrieval is the one capability that genuinely needs the network,
+    so it is also the one that should not be able to take the gateway down -- a
+    spawn failure here would otherwise mean no chat at all, including for the
+    tools that work fine offline. The warning and /health's `mcp` block are how
+    that degradation stays visible instead of looking like a model that refuses to
+    search.
+    """
+    if not settings.literature_mcp_enabled:
+        logger.info("literature MCP server disabled by configuration")
+        return None
+    bridge = MCPToolBridge(_literature_spec(settings))
+    try:
+        return await bridge.connect()
+    except MCPBridgeError:
+        # connect() already logged the traceback; this line is the operator's
+        # summary, and it names the consequence rather than repeating the cause.
+        logger.warning(
+            "continuing without literature tools; the agent will answer from the "
+            "model alone and should say so"
+        )
+        return None
+
+
+def _build_graph(checkpointer: object, tools: list[object]) -> object | None:
     """Compile the Fast Path graph, or return None when there is no credential.
 
     None is a deliberate outcome, not a swallowed error. Building ChatOpenAI
@@ -40,7 +123,7 @@ def _build_graph(checkpointer: object) -> object | None:
     # Binding happens here, at the composition root, not inside the agent node.
     # Which tools a model can see is policy, and D4 will bind a different set
     # per path. A node that binds its own tools cannot be reused across paths.
-    return build_graph(model=model.bind_tools(TOOLS), tools=TOOLS, checkpointer=checkpointer)
+    return build_graph(model=model.bind_tools(tools), tools=tools, checkpointer=checkpointer)
 
 
 @asynccontextmanager
@@ -69,7 +152,26 @@ async def lifespan(app: FastAPI):
     app.state.checkpointer = await make_checkpointer(
         settings.checkpoint_backend, settings.sqlite_path, settings.database_url
     )
-    app.state.graph = _build_graph(app.state.checkpointer)
+    # Connected before the graph is built, because the graph needs the tool list.
+    # Held on app.state for one reason only: aclose() has to run in this same task,
+    # which is the one that entered it (see MCPToolBridge's docstring).
+    app.state.mcp = await _connect_literature(settings)
+    tools = list(TOOLS)
+    if app.state.mcp is not None:
+        tools.extend(app.state.mcp.tools)
+    # Checked at composition time rather than left to ToolNode, which indexes tools
+    # by name and would let one source silently shadow the other. Raising here does
+    # orphan the child for a moment, but a stdio server exits when its stdin
+    # closes, which happens as soon as this process goes away.
+    assert_unique_tool_names(tools)
+    # Wrapped after the uniqueness check so the check runs on the real tool
+    # objects, and before the graph is built so the model binds the wrapped ones.
+    # The wrapper injects a gateway-assigned citation_id into literature results
+    # before the model reads them; see paper_agent.citations for why the ids come
+    # from here and not from the model.
+    tools = bind_citations(tools)
+    logger.info("agent tools: %s", [tool.name for tool in tools])
+    app.state.graph = _build_graph(app.state.checkpointer, tools)
     app.state.tracer = make_tracer(
         public_key=settings.langfuse_public_key,
         secret_key=(
@@ -93,6 +195,11 @@ async def lifespan(app: FastAPI):
     yield
     if app.state.tracer_check is not None:
         app.state.tracer_check.cancel()
+    # First, because it is the only resource that is another process: closing it
+    # ends the literature-search child, and nothing else in this shutdown depends on
+    # a tool call succeeding.
+    if app.state.mcp is not None:
+        await app.state.mcp.aclose()
     shutdown_tracer(app.state.tracer)
     # The sqlite saver owns an aiosqlite connection, and aiosqlite runs it on a
     # thread of its own. Closing it here is what keeps repeated app instances --
@@ -157,4 +264,9 @@ async def health() -> dict:
             "langfuse": getattr(app.state, "tracer", None) is not None,
             "host": settings.langfuse_host,
         },
+        # Tool names and a connected flag, straight from describe(): no env, no
+        # command line, no upstream URLs. "The agent never searches" is otherwise
+        # indistinguishable from "the model chose not to", and this is the one
+        # place that can tell them apart.
+        "mcp": _mcp_health(app),
     }
