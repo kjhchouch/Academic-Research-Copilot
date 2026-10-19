@@ -19,6 +19,7 @@
 
 import { HttpChatTransport } from "ai";
 import type { UIMessage, UIMessageChunk } from "ai";
+import type { Citation } from "@/lib/api";
 
 /** One parsed SSE event. `data` is the joined multi-line data field. */
 type SseEvent = { event: string; data: string };
@@ -163,6 +164,23 @@ export class SseChatTransport extends HttpChatTransport<UIMessage> {
                   }
                   break;
                 }
+                case "citation": {
+                  // The gateway assigns citation_id from a paper a tool actually
+                  // returned, so this is data, not model prose. Carried as a
+                  // `data-citation` part on the assistant message rather than as
+                  // text: the UI turns it into a reference-panel entry and a [n]
+                  // chip lookup, and it must never be concatenated into the reply.
+                  // The id keys the part, so a re-sent citation replaces instead
+                  // of duplicating, while distinct ids stay distinct.
+                  const citation = JSON.parse(parsed.data) as Citation;
+                  if (typeof citation?.citation_id !== "number") break;
+                  controller.enqueue({
+                    type: "data-citation",
+                    id: `citation-${citation.citation_id}`,
+                    data: citation,
+                  });
+                  break;
+                }
                 case "done":
                   sawDone = true;
                   break;
@@ -176,8 +194,8 @@ export class SseChatTransport extends HttpChatTransport<UIMessage> {
                   break;
                 }
                 default:
-                  // D4 adds `route`; Week 2 adds `citation`. Ignoring unknown
-                  // names means an older frontend survives a newer gateway.
+                  // D4 adds `route`. Ignoring unknown names means an older
+                  // frontend survives a newer gateway.
                   break;
               }
             }

@@ -2,8 +2,15 @@
 
 import { useChat } from "@ai-sdk/react";
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
-import type { DynamicToolUIPart } from "ai";
-import { API_BASE, CHAT_ENDPOINT, getThreadId, type UiContext } from "@/lib/api";
+import type { DynamicToolUIPart, UIMessage } from "ai";
+import {
+  API_BASE,
+  CHAT_ENDPOINT,
+  getThreadId,
+  doiUrl,
+  type Citation,
+  type UiContext,
+} from "@/lib/api";
 import { SseChatTransport } from "@/lib/sseTransport";
 
 const PANELS = ["chat", "editor", "outline", "references"] as const;
@@ -12,7 +19,57 @@ const PANELS = ["chat", "editor", "outline", "references"] as const;
  *  the raw name, so a new backend tool shows up without a frontend deploy. */
 const TOOL_LABELS: Record<string, string> = {
   count_words: "统计字数",
+  search_papers: "检索文献",
+  get_paper: "读取论文",
+  format_citation: "生成引用",
 };
+
+/**
+ * The citations carried by one message, keyed by id and in numeric order.
+ *
+ * Scoped per message on purpose: citation_id restarts at 1 every turn, so a [1]
+ * in one answer and a [1] in another are different papers. Reading them from the
+ * same message the [n] appears in is what keeps the chip pointing at the right
+ * entry. The parts are the `data-citation` chunks the transport turned the
+ * gateway's `citation` events into.
+ */
+function citationsOf(message: UIMessage): Citation[] {
+  return message.parts
+    .filter((part) => part.type === "data-citation")
+    .map((part) => (part as unknown as { data: Citation }).data)
+    .filter((c) => c && typeof c.citation_id === "number")
+    .sort((a, b) => a.citation_id - b.citation_id);
+}
+
+function byId(citations: Citation[]): Map<number, Citation> {
+  return new Map(citations.map((c) => [c.citation_id, c]));
+}
+
+/**
+ * Citation ids the answer actually references as [n] in its text.
+ *
+ * The gateway registers every paper the tools returned -- it assigns ids before
+ * the model writes, so it cannot know in advance which will be cited. A broad
+ * search can therefore register dozens of papers the model then ignores. The
+ * panel filters to this set: references = works cited, not works skimmed. Same
+ * narrow regex as `textWithChips`, so a marker becomes a chip and appears here
+ * under exactly one condition.
+ */
+function citedIds(message: UIMessage): Set<number> {
+  const ids = new Set<number>();
+  for (const part of message.parts) {
+    if (part.type === "text") {
+      for (const match of part.text.matchAll(/\[(\d+)\]/g)) ids.add(Number(match[1]));
+    }
+  }
+  return ids;
+}
+
+/** One-line "authors · year · venue" for a chip tooltip or panel entry. */
+function citationMeta(c: Citation): string {
+  const authors = c.authors.length ? `${c.authors.slice(0, 3).join(", ")}${c.authors.length > 3 ? " 等" : ""}` : "";
+  return [authors, c.year, c.venue].filter(Boolean).join(" · ");
+}
 
 function summarize(output: unknown): string {
   if (output == null) return "";
@@ -40,6 +97,78 @@ function ToolChip({ part }: { part: DynamicToolUIPart }) {
     </div>
   );
 }
+
+/**
+ * A `[n]` marker rendered as a clickable superscript chip.
+ *
+ * Hover shows the title and abstract preview; click opens the DOI in a new tab.
+ * The chip only exists because the gateway assigned this citation_id from a paper
+ * a tool actually returned -- that is the "辅助不代写, 引用可核实" half of the
+ * product made visible. A `[n]` with no matching entry (a number the model
+ * invented) is rendered as inert text by `textWithChips` instead, so a fabricated
+ * reference cannot masquerade as a real link.
+ */
+function CitationChip({ citation }: { citation: Citation }) {
+  const url = doiUrl(citation.doi);
+  return (
+    <span className="group relative inline-block">
+      <button
+        type="button"
+        // No DOI means nothing to open; keep it a visible but inert marker rather
+        // than a dead-looking link.
+        onClick={() => url && window.open(url, "_blank", "noopener,noreferrer")}
+        className={`mx-px inline-flex h-[15px] min-w-[15px] items-center justify-center rounded bg-blue-500/20 px-1 align-super text-[10px] font-medium leading-none text-blue-300 transition ${
+          url ? "cursor-pointer hover:bg-blue-500/40" : "cursor-default opacity-60"
+        }`}
+      >
+        {citation.citation_id}
+      </button>
+      <span className="pointer-events-none absolute left-1/2 top-full z-30 mt-1 hidden w-72 -translate-x-1/2 rounded-lg border border-zinc-700 bg-zinc-900 p-2.5 text-left shadow-xl group-hover:block">
+        <span className="block text-xs font-medium leading-snug text-zinc-100">
+          {citation.title}
+        </span>
+        <span className="mt-1 block text-[10px] text-zinc-400">{citationMeta(citation)}</span>
+        {citation.abstract && (
+          <span className="mt-1.5 block max-h-28 overflow-hidden text-[10px] leading-snug text-zinc-400">
+            {citation.abstract}
+          </span>
+        )}
+        {url && <span className="mt-1.5 block font-mono text-[10px] text-blue-400">{citation.doi}</span>}
+      </span>
+    </span>
+  );
+}
+
+/**
+ * Split reply text on `[n]` markers into text and citation chips.
+ *
+ * The regex is deliberately narrow -- a bracketed run of digits and nothing else
+ * -- so ordinary bracketed text like "[注]" or "[12, 15]" is not half-consumed. A
+ * number with no citation behind it stays literal text: the honest rendering of a
+ * reference the tools never returned.
+ */
+function textWithChips(text: string, lookup: Map<number, Citation>): React.ReactNode[] {
+  const nodes: React.ReactNode[] = [];
+  const re = /\[(\d+)\]/g;
+  let last = 0;
+  let key = 0;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    if (match.index > last) nodes.push(text.slice(last, match.index));
+    const citation = lookup.get(Number(match[1]));
+    nodes.push(
+      citation ? (
+        <CitationChip key={`c${key++}`} citation={citation} />
+      ) : (
+        <span key={`t${key++}`}>{match[0]}</span>
+      ),
+    );
+    last = re.lastIndex;
+  }
+  if (last < text.length) nodes.push(text.slice(last));
+  return nodes;
+}
+
 
 // The thread id never changes within a session, so there is nothing to
 // subscribe to — but useSyncExternalStore still requires a stable function.
@@ -91,6 +220,23 @@ export default function ChatPanel() {
   const busy = status === "submitted" || status === "streaming";
   const endRef = useRef<HTMLDivElement>(null);
 
+  // The reference panel follows the newest answer that actually cited something,
+  // so a follow-up turn with no literature does not blank out the previous
+  // answer's references.
+  const activeCitations = (() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const all = citationsOf(messages[i]);
+      if (!all.length) continue;
+      // Most recent answer that retrieved literature. Show only what it cites as
+      // [n], not everything the tools returned. While streaming this is briefly
+      // empty until the model writes its markers -- correct, since nothing is
+      // referenced yet.
+      const cited = citedIds(messages[i]);
+      return all.filter((c) => cited.has(c.citation_id));
+    }
+    return [] as Citation[];
+  })();
+
   useEffect(() => {
     fetch(`${API_BASE}/health`)
       .then((r) => setBackendUp(r.ok))
@@ -113,7 +259,8 @@ export default function ChatPanel() {
   }
 
   return (
-    <div className="flex h-dvh flex-col bg-zinc-950 text-zinc-100">
+    <div className="flex h-dvh bg-zinc-950 text-zinc-100">
+      <div className="flex min-w-0 flex-1 flex-col">
       <header className="flex items-center justify-between border-b border-zinc-800 px-5 py-3">
         <div>
           <h1 className="text-sm font-semibold">Academic Research Copilot</h1>
@@ -149,36 +296,41 @@ export default function ChatPanel() {
       <div className="flex-1 space-y-4 overflow-y-auto px-5 py-6">
         {messages.length === 0 && (
           <p className="mx-auto max-w-md text-center text-sm text-zinc-500">
-            D3：后端是 LangGraph ReAct 图，工具调用会显示在回答里。D4 接意图路由，D6 接真实文献检索。
+            检索文献后，正文里的 [n] 是可点击的引用（悬浮看标题摘要，点开跳 DOI），右侧列出参考文献。
+            试试「找 5 篇 contrastive learning 的代表性论文」。
           </p>
         )}
-        {messages.map((m) => (
-          <div
-            key={m.id}
-            className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
-          >
+        {messages.map((m) => {
+          const lookup = byId(citationsOf(m));
+          return (
             <div
-              className={`max-w-[80%] whitespace-pre-wrap rounded-lg px-3.5 py-2.5 text-sm leading-relaxed ${
-                m.role === "user"
-                  ? "bg-blue-600 text-white"
-                  : "border border-zinc-800 bg-zinc-900 text-zinc-200"
-              }`}
+              key={m.id}
+              className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
             >
-              {m.parts.map((part, i) => {
-                if (part.type === "text") return <span key={i}>{part.text}</span>;
-                if (part.type === "dynamic-tool")
-                  return <ToolChip key={`${part.toolCallId}-${i}`} part={part} />;
-                return null;
-              })}
-              {/* Caret only on the message currently being streamed. */}
-              {m.role === "assistant" &&
-                m.id === messages[messages.length - 1]?.id &&
-                status === "streaming" && (
-                  <span className="ml-0.5 animate-pulse text-zinc-500">▍</span>
-                )}
+              <div
+                className={`max-w-[80%] whitespace-pre-wrap rounded-lg px-3.5 py-2.5 text-sm leading-relaxed ${
+                  m.role === "user"
+                    ? "bg-blue-600 text-white"
+                    : "border border-zinc-800 bg-zinc-900 text-zinc-200"
+                }`}
+              >
+                {m.parts.map((part, i) => {
+                  if (part.type === "text")
+                    return <span key={i}>{textWithChips(part.text, lookup)}</span>;
+                  if (part.type === "dynamic-tool")
+                    return <ToolChip key={`${part.toolCallId}-${i}`} part={part} />;
+                  return null;
+                })}
+                {/* Caret only on the message currently being streamed. */}
+                {m.role === "assistant" &&
+                  m.id === messages[messages.length - 1]?.id &&
+                  status === "streaming" && (
+                    <span className="ml-0.5 animate-pulse text-zinc-500">▍</span>
+                  )}
+              </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
         {status === "submitted" && (
           <div className="flex justify-start">
             <div className="rounded-lg border border-zinc-800 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-500">
@@ -223,7 +375,73 @@ export default function ChatPanel() {
           )}
         </div>
       </form>
+      </div>
+
+      <ReferencesPanel citations={activeCitations} />
     </div>
+  );
+}
+
+/**
+ * The right-hand reference list for the current answer.
+ *
+ * Hidden below `lg` so the chat stays usable on a narrow window; the [n] chips
+ * still carry the same title/abstract on hover there, so nothing is lost, only
+ * the always-visible panel. Every entry links to its DOI -- the same
+ * "verifiable, not invented" guarantee the chip gives, in list form.
+ */
+function ReferencesPanel({ citations }: { citations: Citation[] }) {
+  return (
+    <aside className="hidden w-80 shrink-0 flex-col border-l border-zinc-800 lg:flex">
+      <div className="border-b border-zinc-800 px-4 py-3">
+        <h2 className="text-sm font-semibold">参考文献</h2>
+        <p className="font-mono text-[11px] text-zinc-500">
+          {citations.length} 条 · 本次回答
+        </p>
+      </div>
+      <div className="flex-1 space-y-2 overflow-y-auto px-4 py-3">
+        {citations.length === 0 ? (
+          <p className="text-xs leading-relaxed text-zinc-600">
+            检索文献后，可点击的引用会出现在这里。试试「找 5 篇 contrastive learning
+            的代表性论文」。
+          </p>
+        ) : (
+          citations.map((c) => {
+            const url = doiUrl(c.doi);
+            return (
+              <div
+                key={c.citation_id}
+                className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-2.5"
+              >
+                <div className="flex gap-2">
+                  <span className="mt-px inline-flex h-[15px] min-w-[15px] shrink-0 items-center justify-center rounded bg-blue-500/20 px-1 text-[10px] leading-none text-blue-300">
+                    {c.citation_id}
+                  </span>
+                  <div className="min-w-0">
+                    <p className="text-xs font-medium leading-snug text-zinc-100">{c.title}</p>
+                    <p className="mt-0.5 text-[10px] text-zinc-400">{citationMeta(c)}</p>
+                    {url ? (
+                      <a
+                        href={url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="mt-1 inline-block truncate font-mono text-[10px] text-blue-400 hover:underline"
+                      >
+                        {c.doi}
+                      </a>
+                    ) : (
+                      <span className="mt-1 inline-block font-mono text-[10px] text-zinc-600">
+                        无 DOI
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+    </aside>
   );
 }
 

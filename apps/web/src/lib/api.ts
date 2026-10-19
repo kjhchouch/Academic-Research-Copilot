@@ -9,6 +9,35 @@ export type UiContext = {
   paper_stage?: string;
 };
 
+/**
+ * One reference the agent is allowed to cite, and the wire mirror of
+ * `paper_agent.citations.Citation`. The two must stay in sync by hand — there is
+ * no codegen between the Python gateway and this client — which is exactly why
+ * the shape is kept small and every field is spelled out.
+ *
+ * `citation_id` is assigned by the gateway from a paper a tool actually
+ * returned, never by the model, so a `[n]` in the prose always resolves to a real
+ * entry here or to nothing. `span` is reserved for Week 2 grounding and is
+ * always null today; it is present so the shape does not change when that lands.
+ */
+export type Citation = {
+  citation_id: number;
+  title: string;
+  authors: string[];
+  year: number | null;
+  venue: string | null;
+  doi: string | null;
+  abstract: string | null;
+  span: unknown | null;
+};
+
+/** `https://doi.org/{doi}`, or null when a paper has no DOI to link to. The bare
+ *  DOI is normalized upstream, so this only has to prefix it. */
+export function doiUrl(doi: string | null): string | null {
+  return doi ? `https://doi.org/${doi}` : null;
+}
+
+
 export const API_BASE =
   process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") ?? "http://localhost:8000";
 
