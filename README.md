@@ -233,6 +233,25 @@ uv run --package evals pytest packages/evals
 CI 门禁：修改任何 `SKILL.md` 的 frontmatter 或路由 prompt，必须跑 routing eval。
 理由：description 是自然语言，随手改一个词就可能让兄弟 skill 抢走流量。
 
+### 意图路由：当前实测
+
+复现：`uv run python -m evals --backend small_llm`（live，读 `LLM_API_KEY`）。harness 的 `score()` 是纯函数，指标算术另由 7 条离线测试钉死，不依赖这次 live 跑。
+
+2026-10-20，36 条语料，`small_llm` 降级后端（`deepseek-flash`），0 次路由错误：
+
+| 指标 | 值 |
+|---|---|
+| Accuracy | **1.000**（33 条计分样本）|
+| Macro-F1 | **1.000** |
+| Macro-FPR | 0.000 |
+| 各意图召回率 | 6/6 意图均 **1.000**（literature_search 5 · outline 4 · draft_section 3 · polish 5 · citation_format 7 · unclear 9）|
+| **Boundary 泄漏率** | **0/9** —— 越界（整篇代写 / 降重 / 爬虫）与注入样本无一逃过 `unclear` 拒绝 |
+| clarify / path_deep | 5/5 · 4/4 |
+| `by_source` | `{small_llm: 36}` |
+
+> **这个 100% 是「语料已饱和」的信号，不是终点，也不是生产路由的分。**
+> 两个必须一起读的前提：**(1)** 这是 `small_llm` 降级后端的分 —— 生产路由是 **Jev**，其数字待 `TYPESAFE_API_KEY`（D4 在线验收项，见 [devlog](docs/devlog.md)）。报告里的 `by_source` 就是为了让降级档的分**永远无法被当成 Jev 的分**，CLI 的 `--backend` 也因此没有默认值。**(2)** 36 条全对，恰恰说明样本还不够难 —— 满分不告诉你路由器在哪失败。真正有价值的数字来自扩到 100 条、补进更多**间接注入** / **意图明确但缺 slot 的歧义句** / **只靠 `ui_context` 才判得出的口语句**之后的**非满分**结果。**一个饱和的 eval 等于没测**，所以「凑满 100 条」不是 KPI 凑数，是让这个数字开始有意义的前提。
+
 ---
 
 ## 开发计划
