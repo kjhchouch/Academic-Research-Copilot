@@ -3,7 +3,7 @@
 These tests exist because the vendor set is a *reviewed* artifact, not a
 dependency. Nothing in the Python packaging system tracks it: there is no lock
 entry, no version resolver, and no upstream CI watching it. The only thing
-standing between "six audited skill directories" and "someone dropped a 34 MB
+standing between "seven audited skill directories" and "someone dropped a 34 MB
 directory in here with a network call in it" is this file.
 
 Two invariants matter most:
@@ -16,7 +16,7 @@ Two invariants matter most:
 
 2. **Sibling path resolution.** Vendored skills reach shared reference material
    via ``../nature-shared/core/<file>.md``. Those relative paths only resolve
-   while all six directories stay siblings. Reorganising this tree one level
+   while all seven directories stay siblings. Reorganising this tree one level
    deeper would break every reference at *prompt assembly time*, not at import
    time — a silent failure that would surface as degraded output quality.
 """
@@ -41,6 +41,7 @@ VENDORED_SKILLS = (
     "nature-response",
     "nature-statistics",
     "nature-social-science",
+    "nature-writing",
 )
 
 # Every executable file present at the reviewed commit. Adding a file here
@@ -130,7 +131,7 @@ def test_shared_sibling_references_resolve(vendor_root: Path) -> None:
     Collected from markdown and YAML rather than hardcoded, so a future
     upstream revision that adds a reference is checked too.
 
-    Scoped to the six skill directories: NOTICE and PROVENANCE.md discuss these
+    Scoped to the seven skill directories: NOTICE and PROVENANCE.md discuss these
     paths in prose (``../nature-shared/core/<file>.md``) and would otherwise be
     parsed as references. The pattern also demands a real file extension, which
     is what keeps an illustrative ellipsis from matching.
@@ -147,7 +148,7 @@ def test_shared_sibling_references_resolve(vendor_root: Path) -> None:
     assert found, "no ../nature-shared references found; did the layout change?"
     for ref in sorted(found):
         # Refs are relative to a skill directory, so resolve against any one of
-        # them; all six are siblings by construction.
+        # them; all seven are siblings by construction.
         target = (vendor_root / "nature-polishing" / ref).resolve()
         assert target.is_file(), f"dangling shared reference: {ref}"
         assert target.is_relative_to(vendor_root.resolve()), f"{ref} escapes the vendor tree"
@@ -198,7 +199,7 @@ def test_no_installer_or_build_residue(vendor_root: Path) -> None:
 
 
 def test_no_skill_declares_a_conflicting_license(vendor_root: Path) -> None:
-    """All six are covered by the repository-root Apache-2.0 grant. Upstream has
+    """All seven are covered by the repository-root Apache-2.0 grant. Upstream has
     MIT-licensed skills elsewhere; if one ever lands here, NOTICE is wrong and
     the per-skill LICENSE must be vendored alongside it."""
     for skill in VENDORED_SKILLS:

@@ -7,12 +7,12 @@ This directory vendors a subset of **[Nature Skills](https://github.com/Yuan1z08
 |---|---|
 | Upstream commit | `19be8d45e0d5233aa44be6d4572e655b9914ff54` |
 | Commit date | 2026-10-14T16:01:29+08:00 |
-| Retrieved | 2026-10-14 |
-| Vendored | 6 skills, 123 files, 996 KB |
+| Retrieved | 2026-10-14 (nature-writing added 2026-10-22, same commit) |
+| Vendored | 7 skills, 200 files, 875 KB (896,001 bytes, sum of file sizes) |
 | Modified | none — verbatim copies |
 
-Upstream ships 23 skills. We vendor 6. This file records **why each of the
-other 17 was left out**, so the decision can be re-examined instead of
+Upstream ships 23 skills. We vendor 7. This file records **why each of the
+other 16 was left out**, so the decision can be re-examined instead of
 silently inherited.
 
 ## Why vendor third-party skills at all
@@ -33,18 +33,38 @@ allowed to treat it as one.
 
 | Skill | Maturity | Code | Maps to |
 |---|---|---|---|
-| `nature-shared` | (infra) | 2 files | Dependency of the five below. Upstream README: *"当技能引用 `../nature-shared` 时需要保留"* |
+| `nature-shared` | (infra) | 2 files | Dependency of the six below. Upstream README: *"当技能引用 `../nature-shared` 时需要保留"* |
 | `nature-polishing` | Stable | 0 | **润色** capability |
 | `nature-statistics` | Draft | 0 | **处理数据** layer (a): statistical reporting |
 | `nature-social-science` | Draft | 0 | **提供思路** capability |
 | `nature-ref-verifier` | Stable | 0 | Citation Precision KPI / grounding |
 | `nature-response` | Beta | 3 files | Reviewer-response letters (scope addition approved 2026-10-14) |
+| `nature-writing` | Draft | 0 | **起草/重构章节** capability — section-level only (scope addition approved 2026-10-22; see the boundary condition below) |
+
+### nature-writing boundary condition (辅助不代写)
+
+`nature-writing` is the one vendored skill whose upstream description covers
+drafting a *"full manuscript argument"*, which is wider than this product's
+辅助不代写 boundary permits. Vendoring the **content** is fine; exposing it
+un-narrowed is not. Before the skill loader makes `nature-writing` reachable,
+our own routing layer MUST:
+
+- narrow exposure to **section-level** drafting (abstract / introduction /
+  results / discussion / conclusion), never whole-paper generation;
+- require **author-provided claims, results, figures or notes** as input — the
+  skill drafts from the author's material, it does not invent findings;
+- have **L0 reject whole-paper / 整篇代写 / 降重 requests** outright.
+
+The boundary is ours to enforce, not the skill's. As of 2026-10-22 no skill
+loader exists, so `nature-writing` is vendored-but-unreachable; this condition
+is the gate on wiring it in.
 
 ### Sibling-path constraint (affects the skill loader)
 
 Vendored skills reference shared files as `../nature-shared/core/<file>.md`.
-12 unique such references exist across the six directories, and all 12 resolve
-**only because the six directories are siblings**. The skill loader must
+14 unique such references exist across the seven directories, and all 14 resolve
+**only because the seven directories are siblings** (verified 2026-10-22: every
+referenced `nature-shared` file is present, zero dangling). The skill loader must
 therefore preserve this flat sibling layout, or rewrite those paths at load
 time. Do not nest these directories one level deeper.
 
@@ -64,6 +84,10 @@ Imports are **stdlib only**: `argparse, json, re, sys, dataclasses, decimal,
 pathlib, typing`. No network, no `subprocess`, no `eval`/`exec`, no
 environment-variable or credential access, no filesystem writes outside the
 paths given as arguments.
+
+`nature-writing` (vendored 2026-10-22) adds **no executable files** — all 77
+files are Markdown/YAML, with no `install.sh`, no `scripts/`, no caches — so
+this review set is unchanged and there was nothing to strip.
 
 `check_consistency.py` is a rule-based manuscript consistency checker
 (terminology groups, unit conversion via `Decimal`, numeric agreement) that
@@ -85,9 +109,11 @@ sub-agent — no LLM call, no token cost.
 
 ### Scope exclusions (revisit if scope changes)
 
+`nature-writing` was vendored 2026-10-22 (see the Vendored table and its
+boundary condition above), so it is no longer an exclusion.
+
 | Skill | Reason |
 |---|---|
-| `nature-writing` | 407 KB / 77 files. Its own Core stance is compatible with our 辅助不代写 boundary (*"Do not invent results, mechanisms, references, methods, novelty, sample sizes, statistics or limitations"*), but its description covers drafting a *"full manuscript argument"*. If vendored, exposure must be narrowed at **our** routing layer to section-level with mandatory author-provided claims, and L0 must reject whole-paper requests. The boundary is ours to enforce, not the skill's. |
 | `nature-citation` | Restricted to Nature Portfolio / AAAS Science / Cell Press. Our users write degree theses, so `gb-t-7714` remains the priority. **The mechanism is worth stealing** — split passage into citable segments → search → bind → export RIS/BibTeX is our span-level binding design. |
 | `nature-reviewer` | Mock peer review; pairs naturally with `nature-response`. Deferred, not rejected. |
 | `nature-proposal-writer` | 开题报告 / 研究计划书 state machine (frontmatter name is `researchwrite`; MIT-licensed). Overlaps `nature-social-science`, which already covers 开题报告 and 选题论证. |
@@ -138,15 +164,16 @@ To refresh to a newer upstream commit:
 1. Clone and check out the target commit.
 2. Re-run the code review above on every executable file. Any new dependency,
    network call, or subprocess is a blocking finding.
-3. Re-copy the six directories verbatim, then re-apply and re-record every
+3. Re-copy the seven directories verbatim, then re-apply and re-record every
    entry in the modification log below.
 4. Update the commit SHA and retrieval date in `NOTICE` and in this file.
 5. Re-verify that all `../nature-shared/...` references still resolve.
 
 ## Modification log
 
-Empty. The vendored files are verbatim copies as of `19be8d4`.
+No vendored file has been modified — all are verbatim copies as of `19be8d4`.
+The log below records vendoring *events* (a skill added), not content edits.
 
 | Date | File | Change |
 |---|---|---|
-| — | — | — |
+| 2026-10-22 | `nature-writing/` (77 files) | Vendored verbatim from `19be8d4` (byte-identical on `main` `c6ae86c`); 0 executables, nothing stripped. It carries 13 unique `../nature-shared` refs (42 occurrences), 2 of them new to the tree — bringing the seven-directory unique total to 14 — and all resolve against the vendored `nature-shared`. No content modified. |

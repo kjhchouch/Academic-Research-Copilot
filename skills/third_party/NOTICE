@@ -10,7 +10,7 @@ Upstream work
 Project    : Nature Skills (符合 nature 论文学术表达和科研绘图的 Skill)
 Repository : https://github.com/Yuan1z0825/nature-skills
 Commit     : 19be8d45e0d5233aa44be6d4572e655b9914ff54
-Retrieved  : 2026-10-14
+Retrieved  : 2026-10-14 (nature-writing added 2026-10-22 from the same commit)
 License    : Apache-2.0 (repository root LICENSE)
 
 Copyright holders / authors
@@ -20,7 +20,7 @@ Copyright 2026 马昕瑞 (Ma Xinrui) — core developer
 Git committer of record: 老农民玩AI <mhoang12205@gmail.com>
 
 Individual skills carry no separate `license:` field in their SKILL.md
-frontmatter, so all six vendored skills are covered by the repository-root
+frontmatter, so all seven vendored skills are covered by the repository-root
 Apache-2.0 grant. Two skills elsewhere in the upstream repository
 (`nature-downloader`, `nature-image2ppt`) are MIT-licensed third-party
 contributions with their own LICENSE files; neither is vendored here.
@@ -40,6 +40,8 @@ nature-ref-verifier    Stable
 nature-response        Beta
 nature-statistics      Draft
 nature-social-science  Draft
+nature-writing         Draft  (added 2026-10-22; section-level only — see the
+                       PROVENANCE.md "nature-writing boundary condition")
 
 Maturity labels are upstream's own, taken from the repository README skill
 index at the pinned commit.
