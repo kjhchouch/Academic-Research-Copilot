@@ -14,7 +14,7 @@ cost per test run. This is the smallest thing that fixes that.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
 from langchain_core.callbacks import CallbackManagerForLLMRun
@@ -22,6 +22,8 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.messages.ai import AIMessageChunk
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+
+from paper_agent.routing.decision_model import Decisions, RouteInput
 
 
 class ScriptedChatModel(BaseChatModel):
@@ -108,3 +110,34 @@ class ScriptedChatModel(BaseChatModel):
 def tool_call(name: str, args: dict[str, Any], call_id: str = "call_1") -> AIMessage:
     """An AIMessage that asks for one tool call."""
     return AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": call_id}])
+
+
+class ScriptedRouter:
+    """A fake router returning scripted `Decisions`, to drive the `route` node.
+
+    The routing analogue of `ScriptedChatModel`: the node only ever calls
+    `await router.decide(request)`, so this needs no cache, breaker or backends,
+    and a test can exercise the guard branches without a live decision service.
+
+    Takes either one fixed `Decisions` (the common case -- every request in the
+    test routes the same way) or a callable from `RouteInput` to `Decisions` (a
+    test that pushes several different queries through one compiled graph). The
+    `calls` list records each `RouteInput` so a test can assert the node built it
+    from the right message text and `ui_context`, not just that it returned.
+
+    `aclose` is present to match `ResilientRouter`'s cleanup surface, so a test
+    can tear a graph down the same way production does without a special case.
+    """
+
+    def __init__(self, decisions: Decisions | Callable[[RouteInput], Decisions]) -> None:
+        self._decisions = decisions
+        self.calls: list[RouteInput] = []
+
+    async def decide(self, request: RouteInput) -> Decisions:
+        self.calls.append(request)
+        if callable(self._decisions):
+            return self._decisions(request)
+        return self._decisions
+
+    async def aclose(self) -> None:
+        return None

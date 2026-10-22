@@ -34,7 +34,9 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from paper_agent.graph import build_graph
-from paper_agent.testing import ScriptedChatModel, tool_call
+from paper_agent.routing.decision_model import Decisions
+from paper_agent.routing.guard import CLARIFY_MESSAGE, REFUSE_MESSAGE
+from paper_agent.testing import ScriptedChatModel, ScriptedRouter, tool_call
 from paper_agent.tools import TOOLS
 
 client = TestClient(app)
@@ -384,6 +386,136 @@ def test_a_turn_without_papers_emits_no_citation_events() -> None:
     events = stream(user_msg("数一下这段有多少字"))
     assert [name for name, _ in events if name == "citation"] == []
     assert any(name == "tool" for name, _ in events)  # the tool still ran
+
+
+# --------------------------------------------------------------------------- #
+# Routing preamble — the `route` event and the two guard exits
+# --------------------------------------------------------------------------- #
+#
+# Each test here builds its own graph with a `ScriptedRouter` wired in front of
+# the ReAct core, so START runs the route node before the agent. The scripted
+# model is what the agent *would* say if it ran; on the refuse and clarify paths
+# it must never be reached, and that is exactly the property under test.
+
+
+def _routed_agent(router: Any, agent_reply: str = FINAL_REPLY) -> Any:
+    """Install a router-equipped graph as the override, mirroring `stub_agent`.
+
+    The only difference from the autouse fixture is the `router`, which is what
+    switches on the START -> route -> guard preamble. `agent_reply` is the text
+    the ReAct core produces when the guard lets it through, so a test can name a
+    string that must be absent when the guard stops the turn instead.
+    """
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    model = ScriptedChatModel(responses=[AIMessage(content=agent_reply)])
+    graph = build_graph(
+        model=model.bind_tools(TOOLS),
+        tools=TOOLS,
+        checkpointer=InMemorySaver(),
+        router=router,
+    )
+    app.dependency_overrides[chat_route.get_agent] = lambda: graph
+    return graph
+
+
+def test_route_event_carries_the_whole_decision() -> None:
+    """The `route` event is a stable wire shape: every key present, each sourced
+    from the decision the router returned. The frontend types this once and reads
+    `guard` to decide whether a refusal chip is warranted, so a missing or renamed
+    key is a client-visible bug no server-side assertion would otherwise catch.
+    """
+    _routed_agent(
+        ScriptedRouter(
+            Decisions(
+                intent="citation_format",
+                needs_clarify=False,
+                path_deep=False,
+                confidence=0.91,
+                source="jev",
+                from_cache=False,
+            )
+        )
+    )
+
+    events = stream(user_msg("帮我把参考文献改成国标格式"))
+    route = next(json.loads(data) for name, data in events if name == "route")
+
+    assert route == {
+        "intent": "citation_format",
+        "guard": "proceed",
+        "needs_clarify": False,
+        "path_deep": False,
+        "source": "jev",
+        "confidence": 0.91,
+        "from_cache": False,
+    }
+    # proceed means the ReAct core still ran and its reply still streamed.
+    assert tokens(events) == FINAL_REPLY
+    assert events[-1][0] == "done"
+
+
+def test_a_boundary_query_is_refused_and_the_agent_never_runs() -> None:
+    """The L0 override, end to end through the gateway.
+
+    The router LEAKS on purpose: it calls a 降重 request `polish`. The guard must
+    refuse it anyway, because `boundary_violation` runs on the raw query and
+    outranks the model's intent. What proves it held is that the agent's scripted
+    reply never reaches the wire -- the only text the user sees is the refusal.
+    """
+    _routed_agent(
+        ScriptedRouter(
+            Decisions(
+                intent="polish",
+                needs_clarify=False,
+                path_deep=False,
+                confidence=0.83,
+                source="small_llm",
+            )
+        ),
+        agent_reply="这段我帮你改写了，重复率应该能降下来。",
+    )
+
+    events = stream(user_msg("帮我把这段降重"))
+    names = [name for name, _ in events]
+
+    route = next(json.loads(data) for name, data in events if name == "route")
+    assert route["guard"] == "refuse"
+    assert route["intent"] == "polish"  # leaked, and deliberately ignored
+
+    assert tokens(events) == REFUSE_MESSAGE
+    assert "重复率应该能降下来" not in tokens(events)  # the agent never ran
+    assert "tool" not in names  # ...so no tool ran either
+    assert events[-1][0] == "done"
+
+
+def test_an_unclear_query_is_clarified_and_the_agent_never_runs() -> None:
+    """The other guard exit. `unclear` (or `needs_clarify`) means "couldn't tell",
+    not "won't do": the reply asks the user to specify instead of refusing. The
+    structural guarantee matches the refusal -- one fixed message, no agent, no
+    tool, and a clean `done`.
+    """
+    _routed_agent(
+        ScriptedRouter(
+            Decisions(
+                intent="unclear",
+                needs_clarify=True,
+                path_deep=False,
+                confidence=0.0,
+                source="static",
+            )
+        ),
+        agent_reply="不该被触及的回复",
+    )
+
+    events = stream(user_msg("在吗"))
+    route = next(json.loads(data) for name, data in events if name == "route")
+
+    assert route["guard"] == "clarify"
+    assert tokens(events) == CLARIFY_MESSAGE
+    assert "不该被触及的回复" not in tokens(events)
+    assert not any(name == "tool" for name, _ in events)
+    assert events[-1][0] == "done"
 
 
 def test_chat_stream_sends_utf8_not_escaped() -> None:

@@ -9,6 +9,7 @@ from paper_agent.citations import bind_citations
 from paper_agent.graph import build_graph
 from paper_agent.llm import make_chat_model
 from paper_agent.observability import make_tracer, shutdown_tracer, verify_tracer
+from paper_agent.routing import make_router
 from paper_agent.storage import make_blob_store, make_cache, make_checkpointer
 from paper_agent.tools import (
     TOOLS,
@@ -101,7 +102,48 @@ async def _connect_literature(settings: Settings) -> MCPToolBridge | None:
         return None
 
 
-def _build_graph(checkpointer: object, tools: list[object]) -> object | None:
+def _build_router(settings: Settings, cache: object) -> object | None:
+    """Compose the D4 routing cascade, or None when no backend is configured.
+
+    None means `build_graph` gets `router=None` and compiles the bare ReAct loop
+    with no routing preamble -- the product still answers, it just does not gate
+    or classify. That is the local-first rule the tracer and checkpointer already
+    follow: boot with zero external services.
+
+    The fallback is the cheap chat model, not the reasoning one -- routing is a
+    small structured classification, and `llm_chat_model` is what the config
+    already designates for "the cheap graph nodes". So whenever the agent itself
+    can run (an `llm_api_key` exists), routing is on through the fallback alone;
+    the Jev key only upgrades the primary tier, and its absence is not a reason to
+    route nothing. The cache is shared with the rest of the app, which is what
+    makes a retry of the same message route identically (see `resilience.py`).
+    """
+    if not settings.llm_api_key and not settings.typesafe_api_key:
+        return None
+    fallback_model = (
+        None
+        if not settings.llm_api_key
+        else make_chat_model(
+            base_url=settings.llm_base_url,
+            api_key=settings.llm_api_key.get_secret_value(),
+            model=settings.llm_chat_model,
+            max_tokens=settings.llm_max_tokens,
+            temperature=settings.llm_temperature,
+        )
+    )
+    return make_router(
+        jev_api_key=(
+            settings.typesafe_api_key.get_secret_value() if settings.typesafe_api_key else None
+        ),
+        jev_model=settings.decision_model_backend,
+        fallback_model=fallback_model,
+        cache=cache,
+    )
+
+
+def _build_graph(
+    checkpointer: object, tools: list[object], router: object | None = None
+) -> object | None:
     """Compile the Fast Path graph, or return None when there is no credential.
 
     None is a deliberate outcome, not a swallowed error. Building ChatOpenAI
@@ -110,6 +152,9 @@ def _build_graph(checkpointer: object, tools: list[object]) -> object | None:
     it. Returning None makes /api/chat answer 503 with "LLM not configured" and
     /health's key_present explain why -- and it lets the test suite run the whole
     HTTP contract with no credentials at all.
+
+    `router` is threaded straight through to `build_graph`; when it is None the
+    graph has no routing preamble (see `_build_router`).
     """
     if not settings.llm_api_key:
         return None
@@ -123,7 +168,9 @@ def _build_graph(checkpointer: object, tools: list[object]) -> object | None:
     # Binding happens here, at the composition root, not inside the agent node.
     # Which tools a model can see is policy, and D4 will bind a different set
     # per path. A node that binds its own tools cannot be reused across paths.
-    return build_graph(model=model.bind_tools(tools), tools=tools, checkpointer=checkpointer)
+    return build_graph(
+        model=model.bind_tools(tools), tools=tools, checkpointer=checkpointer, router=router
+    )
 
 
 @asynccontextmanager
@@ -171,7 +218,13 @@ async def lifespan(app: FastAPI):
     # from here and not from the model.
     tools = bind_citations(tools)
     logger.info("agent tools: %s", [tool.name for tool in tools])
-    app.state.graph = _build_graph(app.state.checkpointer, tools)
+    # Built before the graph, which takes it as the routing preamble, and after the
+    # cache, which it shares -- so a retried message routes identically instead of
+    # re-asking a model. None here is a supported configuration, not a failure: it
+    # means the bare ReAct loop with no gate (see _build_router).
+    app.state.router = _build_router(settings, app.state.cache)
+    logger.info("routing: %s", "on" if app.state.router is not None else "off (bare ReAct loop)")
+    app.state.graph = _build_graph(app.state.checkpointer, tools, router=app.state.router)
     app.state.tracer = make_tracer(
         public_key=settings.langfuse_public_key,
         secret_key=(
@@ -200,6 +253,11 @@ async def lifespan(app: FastAPI):
     # a tool call succeeding.
     if app.state.mcp is not None:
         await app.state.mcp.aclose()
+    # The router may hold a Jev client with an open socket. aclose is a no-op when
+    # it is absent or has no backends (see ResilientRouter.aclose), so this is safe
+    # whether routing is on, off, or never built because lifespan errored early.
+    if getattr(app.state, "router", None) is not None:
+        await app.state.router.aclose()
     shutdown_tracer(app.state.tracer)
     # The sqlite saver owns an aiosqlite connection, and aiosqlite runs it on a
     # thread of its own. Closing it here is what keeps repeated app instances --
@@ -263,6 +321,16 @@ async def health() -> dict:
         "tracing": {
             "langfuse": getattr(app.state, "tracer", None) is not None,
             "host": settings.langfuse_host,
+        },
+        # Presence flags again. "Is the boundary gate even on?" is the first
+        # question when a request is or is not refused, and `configured` answers
+        # it: a False here means the bare ReAct loop with no routing preamble, so
+        # nothing is being classified or gated. Backend name and a key-presence
+        # flag, never the key.
+        "routing": {
+            "configured": getattr(app.state, "router", None) is not None,
+            "backend": settings.decision_model_backend,
+            "jev_key_present": bool(settings.typesafe_api_key),
         },
         # Tool names and a connected flag, straight from describe(): no env, no
         # command line, no upstream URLs. "The agent never searches" is otherwise

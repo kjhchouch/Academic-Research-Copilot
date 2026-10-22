@@ -11,10 +11,22 @@ The gateway emits its own tiny event vocabulary rather than the Vercel AI SDK's
 `UIMessageChunk` protocol:
 
     event: token   data: {"text": "..."}     one text delta
+    event: route   data: {...}               the D4 routing decision for this turn
     event: tool    data: {...}               a tool call started or finished
     event: citation data: {...}              one paper the agent may cite as [n]
     event: done    data: {}                  stream finished cleanly
     event: error   data: {"message": "..."}  stream failed; no `done` follows
+
+`route` arrives once per turn, before any `token`, and carries the routing
+decision with a stable shape -- `intent`, `guard`, `needs_clarify`, `path_deep`,
+`source`, `confidence`, `from_cache`, each present and null when unknown. `guard`
+is the load-bearing one: `"refuse"` and `"clarify"` mean the agent never ran, and
+the single `token` that follows is the fixed boundary or clarification message
+(the guard nodes emit it as an ordinary assistant turn, so the frontend renders a
+refusal exactly like a reply). `"proceed"` means the ReAct loop is running and
+`token`/`tool`/`citation` follow as usual. It is emitted only when a router is
+wired; a gateway with no routing backend configured sends no `route` event, and
+the transport already ignores unknown event names either way.
 
 `tool` carries `status: "start"` with `name`/`id`/`args`, or `status: "end"` with
 `name`/`id`/`result`. `result` is a JSON value, not a JSON string — see
@@ -26,12 +38,6 @@ Why not just speak the SDK's protocol from Python: that format is an internal
 detail of a TypeScript package and it changes between releases. Keeping the
 wire format owned by this service means `apps/web` does the mapping once, in a
 typed custom transport that the compiler checks against the installed SDK.
-
-`route` is not emitted yet and deliberately so. A protocol event carrying
-placeholder data is worse than no event: the frontend cannot tell a real value
-from a stub, and the first consumer written against the stub will encode its
-fakeness. `route` arrives with the D4 cascade. The transport already ignores
-unknown event names, so adding it later needs no frontend change.
 """
 
 from __future__ import annotations
@@ -232,6 +238,48 @@ def _result_of(content: Any) -> Any:
         return content
 
 
+def _route_event(update: dict[str, Any] | None) -> dict[str, str] | None:
+    """The `route` node's state update as one `route` event, or None.
+
+    Stable shape, every key present and null when the router did not supply it --
+    the same rule as `_citation_payload`, so the frontend types the event once.
+    Keyed off `guard` rather than `intent` because `guard` is the field the graph
+    actually branched on; if it is absent this is not a route update at all.
+    """
+    fields = update or {}
+    if "guard" not in fields:
+        return None
+    return _event(
+        "route",
+        {
+            "intent": fields.get("intent"),
+            "guard": fields.get("guard"),
+            "needs_clarify": fields.get("needs_clarify"),
+            "path_deep": fields.get("path_deep"),
+            "source": fields.get("route_source"),
+            "confidence": fields.get("route_confidence"),
+            "from_cache": fields.get("route_from_cache"),
+        },
+    )
+
+
+def _guard_text_events(update: dict[str, Any] | None) -> list[dict[str, str]]:
+    """A `refuse`/`clarify` node's fixed message, streamed as `token` events.
+
+    These nodes emit a plain `AIMessage`, not a model generation, so it never
+    appears in `stream_mode="messages"` -- only here, in the node update. Routing
+    it through the same `token` event as real model output is deliberate: to the
+    user a refusal is just the assistant's reply, and the frontend already knows
+    how to render `token`. Emitting a distinct event type would make the client
+    special-case a message that is, on the wire, ordinary prose.
+    """
+    events: list[dict[str, str]] = []
+    for message in (update or {}).get("messages", []):
+        if isinstance(message, AIMessage) and isinstance(message.content, str) and message.content:
+            events.append(_event("token", {"text": message.content}))
+    return events
+
+
 def _public_error(exc: Exception) -> str:
     """A message safe to show a user, and useless to an attacker.
 
@@ -324,6 +372,17 @@ async def _agent_stream(
                             yield _event("token", {"text": message.content})
                 else:
                     for node, update in chunk_or_update.items():
+                        # `route` carries no messages and the guard nodes carry no
+                        # tool calls, so these branches and `_tool_events` are
+                        # mutually exclusive by node name -- one update is exactly
+                        # one of them.
+                        if node == "route":
+                            event = _route_event(update)
+                            if event is not None:
+                                yield event
+                        elif node in ("refuse", "clarify"):
+                            for event in _guard_text_events(update):
+                                yield event
                         for event in _tool_events(node, update):
                             yield event
                     # Drained after each node update, not once at the end: papers
