@@ -71,6 +71,9 @@ class ScriptedChatModel(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         message = self._next_response(messages)
+        message = message.model_copy(
+            update={"response_metadata": {"finish_reason": "stop", **message.response_metadata}}
+        )
         return ChatResult(generations=[ChatGeneration(message=message)])
 
     def _stream(
@@ -105,6 +108,13 @@ class ScriptedChatModel(BaseChatModel):
         step = max(1, self.chunk_size)
         for start in range(0, len(text), step):
             yield ChatGenerationChunk(message=AIMessageChunk(content=text[start : start + step]))
+        yield ChatGenerationChunk(
+            message=AIMessageChunk(
+                content="",
+                response_metadata={"finish_reason": "stop", **message.response_metadata},
+                usage_metadata=message.usage_metadata,
+            )
+        )
 
 
 def tool_call(name: str, args: dict[str, Any], call_id: str = "call_1") -> AIMessage:

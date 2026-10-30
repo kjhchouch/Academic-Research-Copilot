@@ -19,7 +19,7 @@
 
 import { HttpChatTransport } from "ai";
 import type { UIMessage, UIMessageChunk } from "ai";
-import type { Citation } from "@/lib/api";
+import type { Citation, RouteDecision } from "@/lib/api";
 
 /** One parsed SSE event. `data` is the joined multi-line data field. */
 type SseEvent = { event: string; data: string };
@@ -144,6 +144,12 @@ export class SseChatTransport extends HttpChatTransport<UIMessage> {
                       type: "tool-input-start",
                       toolCallId: evt.id,
                       toolName,
+                      // dynamic: true is load-bearing in AI SDK v7. Without it the
+                      // SDK files the call under a static `tool-<name>` part (for
+                      // tools registered in useChat's `tools` prop); these gateway
+                      // tools are never registered there, so only `dynamic: true`
+                      // yields the `dynamic-tool` part the activity log reads.
+                      dynamic: true,
                     });
                     // The gateway sends args whole rather than as input deltas,
                     // so `input-available` follows immediately. Without it the
@@ -154,12 +160,14 @@ export class SseChatTransport extends HttpChatTransport<UIMessage> {
                       toolCallId: evt.id,
                       toolName,
                       input: evt.args,
+                      dynamic: true,
                     });
                   } else {
                     controller.enqueue({
                       type: "tool-output-available",
                       toolCallId: evt.id,
                       output: evt.result,
+                      dynamic: true,
                     });
                   }
                   break;
@@ -181,6 +189,56 @@ export class SseChatTransport extends HttpChatTransport<UIMessage> {
                   });
                   break;
                 }
+                case "route": {
+                  // The gateway sends one `route` decision per turn, before any
+                  // token. Carried as a `data-route` part (mirroring citation) so
+                  // the RoutePanel and the inline RouteChip read it as data, not
+                  // prose. Fixed id "route": one decision per turn means a re-send
+                  // replaces rather than duplicates — unlike citation, which keys
+                  // per citation_id because a turn carries many.
+                  const route = JSON.parse(parsed.data) as RouteDecision;
+                  if (!route || typeof route !== "object") break;
+                  controller.enqueue({
+                    type: "data-route",
+                    id: "route",
+                    data: route,
+                  });
+                  break;
+                }
+                case "knowledge-source": {
+                  const source = JSON.parse(parsed.data) as { source_id?: string };
+                  if (typeof source.source_id !== "string") break;
+                  controller.enqueue({
+                    type: "data-knowledge-source",
+                    id: `knowledge-${source.source_id}`,
+                    data: source,
+                  });
+                  break;
+                }
+                case "knowledge-coverage": {
+                  controller.enqueue({
+                    type: "data-knowledge-coverage",
+                    id: "knowledge-coverage",
+                    data: JSON.parse(parsed.data),
+                  });
+                  break;
+                }
+                case "message-id": {
+                  controller.enqueue({
+                    type: "data-server-message-id",
+                    id: "server-message-id",
+                    data: JSON.parse(parsed.data),
+                  });
+                  break;
+                }
+                case "turn-status": {
+                  controller.enqueue({
+                    type: "data-turn-status",
+                    id: "turn-status",
+                    data: JSON.parse(parsed.data),
+                  });
+                  break;
+                }
                 case "done":
                   sawDone = true;
                   break;
@@ -194,8 +252,8 @@ export class SseChatTransport extends HttpChatTransport<UIMessage> {
                   break;
                 }
                 default:
-                  // D4 adds `route`. Ignoring unknown names means an older
-                  // frontend survives a newer gateway.
+                  // Unknown event names are ignored so an older frontend survives
+                  // a newer gateway. `route` and `citation` are handled above.
                   break;
               }
             }

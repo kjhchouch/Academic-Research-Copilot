@@ -35,7 +35,7 @@ Still planned, in the order they arrive:
 
 from __future__ import annotations
 
-from typing import Annotated, Any, NotRequired, TypedDict
+from typing import Annotated, Any, Literal, NotRequired, TypedDict
 
 from langchain_core.messages import AnyMessage
 from langgraph.graph.message import add_messages
@@ -77,10 +77,10 @@ class AgentState(TypedDict):
     # rest ride along so the gateway can emit a complete `route` event and the
     # trace can attribute the decision to a backend (route_source), a confidence,
     # and a cache hit, without a second lookup.
-    intent: NotRequired[Intent]
+    intent: NotRequired[Intent | Literal["knowledge_qa"]]
     guard: NotRequired[Guard]
     needs_clarify: NotRequired[bool]
     path_deep: NotRequired[bool]
-    route_source: NotRequired[RouteSource]
+    route_source: NotRequired[RouteSource | Literal["knowledge"]]
     route_confidence: NotRequired[float]
     route_from_cache: NotRequired[bool]

@@ -62,3 +62,6 @@ docs/*.mov
 # public repo. Ignoring it also keeps `ruff check .` off 60k lines of generated
 # layout code, which respects .gitignore by default.
 /talk/
+
+# Brainstorming visual-companion mockups (local, ephemeral, never product code).
+.superpowers/

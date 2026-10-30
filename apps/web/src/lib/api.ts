@@ -31,6 +31,32 @@ export type Citation = {
   span: unknown | null;
 };
 
+/**
+ * One turn's routing decision, and the wire mirror of the gateway's `route`
+ * event (apps/api/src/api/routes/chat.py:_route_event). Every key is present and
+ * null when the router did not supply it — the same rule as `Citation`.
+ *
+ * `guard` is the load-bearing field: "refuse"/"clarify" mean the agent never ran
+ * and the only text is the fixed boundary/clarification message; "proceed" means
+ * the ReAct loop ran. Typed as a union because the backend pins it to
+ * Literal["proceed","clarify","refuse"], but every consumer maps it with a
+ * neutral fallback so a future 4th value degrades instead of crashing.
+ *
+ * `intent`/`source` stay `string` (wider than the backend Literal) on purpose:
+ * they are display-only, and a narrowed type here would be a lie the moment the
+ * backend adds a value. `intent` ∈ literature_search | outline | draft_section |
+ * polish | citation_format | unclear; `source` ∈ jev | small_llm | static.
+ */
+export type RouteDecision = {
+  intent: string | null;
+  guard: "proceed" | "clarify" | "refuse" | null;
+  needs_clarify: boolean | null;
+  path_deep: boolean | null;
+  source: string | null;
+  confidence: number | null;
+  from_cache: boolean | null;
+};
+
 /** `https://doi.org/{doi}`, or null when a paper has no DOI to link to. The bare
  *  DOI is normalized upstream, so this only has to prefix it. */
 export function doiUrl(doi: string | null): string | null {

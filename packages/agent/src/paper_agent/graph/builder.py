@@ -43,6 +43,7 @@ from langgraph.prebuilt import ToolNode, tools_condition
 
 from paper_agent.graph.nodes import make_agent_node, make_guard_node, make_route_node
 from paper_agent.graph.state import AgentState
+from paper_agent.knowledge import knowledge_sources
 from paper_agent.prompts.system import FAST_PATH_SYSTEM_PROMPT
 from paper_agent.routing.guard import CLARIFY_MESSAGE, REFUSE_MESSAGE
 
@@ -78,6 +79,8 @@ def build_graph(
     checkpointer: Any = None,
     system_prompt: str | None = FAST_PATH_SYSTEM_PROMPT,
     router: Any = None,
+    knowledge_model: Any = None,
+    comparison_model: Any = None,
 ) -> Any:
     """Compile the Fast Path graph.
 
@@ -95,16 +98,31 @@ def build_graph(
     `await router.decide(...)`, and tests pass a scripted fake.
     """
     graph = StateGraph(AgentState)
-    graph.add_node("agent", make_agent_node(model, system_prompt=system_prompt))
+    graph.add_node(
+        "agent",
+        make_agent_node(
+            model,
+            system_prompt=system_prompt,
+            knowledge_model=knowledge_model,
+            comparison_model=comparison_model,
+        ),
+    )
     graph.add_node("tools", ToolNode(tools))
 
-    if router is None:
+    if router is None and knowledge_model is None:
         graph.add_edge(START, "agent")
     else:
         graph.add_node("route", make_route_node(router))
         graph.add_node("refuse", make_guard_node(REFUSE_MESSAGE))
         graph.add_node("clarify", make_guard_node(CLARIFY_MESSAGE))
-        graph.add_edge(START, "route")
+        if router is None:
+            graph.add_conditional_edges(
+                START,
+                lambda state: "route" if knowledge_sources() is not None else "agent",
+                {"route": "route", "agent": "agent"},
+            )
+        else:
+            graph.add_edge(START, "route")
         # A mapping dict, not a bare conditional: the guard names the exit, and
         # an unmapped value would raise at invoke time rather than pick a default.
         graph.add_conditional_edges(

@@ -20,7 +20,8 @@ from paper_agent.tools import (
 )
 
 from api.config import Settings, get_settings
-from api.routes import chat
+from api.routes import chat, workspace
+from api.workspace_store import WorkspaceStore
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -169,7 +170,19 @@ def _build_graph(
     # Which tools a model can see is policy, and D4 will bind a different set
     # per path. A node that binds its own tools cannot be reused across paths.
     return build_graph(
-        model=model.bind_tools(tools), tools=tools, checkpointer=checkpointer, router=router
+        model=model.bind_tools(tools),
+        knowledge_model=model,
+        comparison_model=make_chat_model(
+            base_url=settings.llm_base_url,
+            api_key=settings.llm_api_key.get_secret_value(),
+            model=settings.llm_reasoning_model,
+            max_tokens=settings.llm_max_tokens,
+            temperature=0,
+            max_retries=0,
+        ),
+        tools=tools,
+        checkpointer=checkpointer,
+        router=router,
     )
 
 
@@ -185,6 +198,10 @@ async def lifespan(app: FastAPI):
     )
     # Built here rather than at import time so a misconfigured backend fails
     # loudly at startup instead of on the first request.
+    app.state.workspace = await asyncio.to_thread(
+        WorkspaceStore, settings.workspace_sqlite_path, settings.storage_dir + "/workspace"
+    )
+    app.state.active_sessions = set()
     app.state.cache = make_cache(settings.cache_backend, settings.redis_url)
     app.state.blobs = make_blob_store(
         settings.blob_backend,
@@ -293,6 +310,7 @@ app.add_middleware(
 )
 
 app.include_router(chat.router)
+app.include_router(workspace.router)
 
 
 @app.get("/health")

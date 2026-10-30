@@ -42,6 +42,7 @@ typed custom transport that the compiler checks against the installed SDK.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -54,10 +55,14 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 from paper_agent.citations import Citation, CitationRegistry, bind_registry
 from paper_agent.graph import DEFAULT_RECURSION_LIMIT
+from paper_agent.knowledge import ComparisonReviewError, bind_knowledge, knowledge_guard
 from paper_agent.observability import trace_metadata, tracer_callbacks
 from paper_agent.pricing import UnknownModelError, cost_of, format_usd
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sse_starlette.sse import EventSourceResponse
+
+from api.conversation_stream import record_stream
+from api.research import build_comparison_context
 
 logger = logging.getLogger(__name__)
 
@@ -103,8 +108,25 @@ class ChatRequest(BaseModel):
     messages: list[UIMessage] = Field(min_length=1)
     trigger: Literal["submit-message", "regenerate-message"] | None = None
     ui_context: UiContext | None = None
+    project_id: str | None = Field(default=None, min_length=1, max_length=64)
+    use_knowledge: bool = False
+    document_ids: list[str] = Field(default_factory=list, max_length=50)
+    knowledge_task: Literal["qa", "compare"] = "qa"
 
     model_config = ConfigDict(populate_by_name=True)
+
+    @model_validator(mode="after")
+    def _require_comparison_scope(self) -> ChatRequest:
+        if self.knowledge_task == "compare":
+            if not self.use_knowledge or not self.project_id or not self.thread_id:
+                raise ValueError("资料对比必须启用资料问答并指定项目和已创建的会话")
+            if (
+                not 2 <= len(self.document_ids) <= 5
+                or len(set(self.document_ids)) != len(self.document_ids)
+                or any(not identifier.strip() for identifier in self.document_ids)
+            ):
+                raise ValueError("资料对比需要选择 2 至 5 份不重复的资料")
+        return self
 
     @model_validator(mode="after")
     def _require_user_text(self) -> ChatRequest:
@@ -287,6 +309,10 @@ def _public_error(exc: Exception) -> str:
     OpenAI SDK it can contain the api key's last four characters or a echoed
     Authorization header. The detail goes to the log, never to the stream.
     """
+    if isinstance(exc, ComparisonReviewError):
+        # The cause may echo a private draft or review JSON; do not log its traceback.
+        logger.warning("comparison evidence review failed")
+        return "资料对比核验未通过，请重试或调整所选资料。"
     name = type(exc).__name__
     if name == "GraphRecursionError":
         return "agent exceeded its step limit; the request was stopped"
@@ -301,7 +327,12 @@ type UsageByMessage = dict[str, tuple[str, dict[str, Any]]]
 
 
 async def _agent_stream(
-    req: ChatRequest, agent: Any, thread_id: str, tracer: Any | None = None
+    req: ChatRequest,
+    agent: Any,
+    thread_id: str,
+    tracer: Any | None = None,
+    knowledge: list[dict[str, Any]] | None = None,
+    comparison: dict[str, Any] | None = None,
 ) -> AsyncIterator[dict[str, str]]:
     ui_context = (
         req.ui_context.model_dump(exclude_none=True) if req.ui_context is not None else None
@@ -349,26 +380,44 @@ async def _agent_stream(
     usage: UsageByMessage = {}
     registry = CitationRegistry()
     cited = 0
+    knowledge_sent = False
+    comparison_answer_sent = False
+    query_guard = knowledge_guard(last_user_text(req.messages)) if knowledge is not None else None
+    stream_guard = "proceed"
+
+    def knowledge_events() -> list[dict[str, str]]:
+        nonlocal knowledge_sent
+        if knowledge_sent or knowledge is None or query_guard != "proceed":
+            return []
+        if stream_guard != "proceed":
+            return []
+        knowledge_sent = True
+        events = [_event("knowledge-coverage", comparison)] if comparison is not None else []
+        events.extend(_event("knowledge-source", source) for source in knowledge)
+        return events
+
     try:
         # Bound for the whole stream so the citation wrappers deep inside the
         # graph's ToolNode -- which were built once in lifespan and cannot close
         # over per-request state -- find this turn's registry through the
         # ContextVar. Reset in the context manager's finally, including on error
         # or client abandonment.
-        with bind_registry(registry):
+        with bind_registry(registry), bind_knowledge(knowledge, comparison):
             async for mode, chunk_or_update in agent.astream(
                 graph_input, config, stream_mode=["messages", "updates"]
             ):
                 if mode == "messages":
-                    message, _meta = chunk_or_update
-                    # Type, not node name. `stream_mode="messages"` also yields the
-                    # ToolMessage produced by the tools node, and without this filter
-                    # the tool's raw JSON is streamed to the user as if the model had
-                    # written it. Filtering on langgraph_node would work today and
-                    # break silently the first time a node is renamed.
+                    message, meta = chunk_or_update
                     if isinstance(message, AIMessageChunk):
                         _record_usage(usage, message)
-                        if isinstance(message.content, str) and message.content:
+                        if (
+                            comparison is None
+                            and meta.get("langgraph_node", "agent") == "agent"
+                            and isinstance(message.content, str)
+                            and message.content
+                        ):
+                            # Comparison chunks are private draft/review output. Only
+                            # the node's validated final update may publish its answer.
                             yield _event("token", {"text": message.content})
                 else:
                     for node, update in chunk_or_update.items():
@@ -377,12 +426,25 @@ async def _agent_stream(
                         # mutually exclusive by node name -- one update is exactly
                         # one of them.
                         if node == "route":
+                            stream_guard = (update or {}).get("guard", "clarify")
                             event = _route_event(update)
                             if event is not None:
                                 yield event
                         elif node in ("refuse", "clarify"):
+                            stream_guard = node
                             for event in _guard_text_events(update):
                                 yield event
+                        elif node == "agent" and knowledge is not None:
+                            stream_guard = (update or {}).get("guard", stream_guard)
+                            for event in knowledge_events():
+                                yield event
+                            if not knowledge or stream_guard != "proceed":
+                                for event in _guard_text_events(update):
+                                    yield event
+                            elif comparison is not None and not comparison_answer_sent:
+                                for event in _guard_text_events(update):
+                                    comparison_answer_sent = True
+                                    yield event
                         for event in _tool_events(node, update):
                             yield event
                     # Drained after each node update, not once at the end: papers
@@ -495,11 +557,89 @@ def get_tracer(request: Request) -> Any | None:
 @router.post("/chat")
 async def chat_endpoint(
     req: ChatRequest,
+    request: Request,
     agent: Any = Depends(get_agent),
     tracer: Any | None = Depends(get_tracer),
 ) -> EventSourceResponse:
-    # A thread without an id still needs one for the checkpointer. Ephemeral is
-    # correct here, not a bug: an anonymous turn should not silently resume
-    # somebody else's conversation.
     thread_id = req.thread_id or uuid.uuid4().hex
-    return EventSourceResponse(_agent_stream(req, agent, thread_id, tracer))
+    store = getattr(request.app.state, "workspace", None)
+    if req.project_id is None:
+        if req.use_knowledge or req.document_ids:
+            raise HTTPException(422, "资料问答必须指定研究项目")
+        if thread_id.startswith("project:") or (
+            store is not None and await asyncio.to_thread(store.session_exists_anywhere, thread_id)
+        ):
+            raise HTTPException(404, "会话不存在于此范围")
+        return EventSourceResponse(_agent_stream(req, agent, thread_id, tracer))
+
+    if store is None:
+        raise HTTPException(503, "工作区存储尚未就绪")
+    if req.thread_id is None:
+        raise HTTPException(422, "请先创建项目会话")
+    project_id = req.project_id
+    try:
+        await asyncio.to_thread(store.get_session, project_id, thread_id)
+        documents = [
+            await asyncio.to_thread(store.get_document, project_id, document_id)
+            for document_id in req.document_ids
+        ]
+        if req.knowledge_task == "compare" and any(d["status"] != "ready" for d in documents):
+            raise HTTPException(422, "资料对比仅支持解析就绪的资料")
+        saved = await asyncio.to_thread(store.session_messages, project_id, thread_id)
+    except KeyError as exc:
+        raise HTTPException(404, "项目、会话或资料不存在于当前范围") from exc
+
+    newest = next(message for message in reversed(req.messages) if message.role == "user")
+    if any(message["id"] == newest.id for message in saved):
+        raise HTTPException(409, "此消息已经保存，请发送一条新消息")
+    active = getattr(request.app.state, "active_sessions", None)
+    if active is None:
+        active = request.app.state.active_sessions = set()
+    if thread_id in active:
+        raise HTTPException(409, "此会话正在生成回答，请等待完成或停止后再试")
+    active.add(thread_id)
+    try:
+        sources = None
+        comparison = None
+        if req.knowledge_task == "compare":
+            try:
+                sources, comparison = await asyncio.to_thread(
+                    build_comparison_context,
+                    store,
+                    project_id,
+                    last_user_text(req.messages),
+                    req.document_ids,
+                )
+            except ValueError as exc:
+                raise HTTPException(422, "资料对比需要 2 至 5 份不重复且解析就绪的资料") from exc
+        elif req.use_knowledge:
+            found = await asyncio.to_thread(
+                store.search,
+                project_id,
+                last_user_text(req.messages)[:2000],
+                req.document_ids or None,
+            )
+            sources = [
+                {**chunk, "project_id": project_id, "source_id": f"K{index}"}
+                for index, chunk in enumerate(found, 1)
+            ]
+        server_req = req.model_copy(
+            update={"messages": [*[UIMessage.model_validate(message) for message in saved], newest]}
+        )
+        # Project content must not enter the external trace or a legacy thread namespace.
+        events = _agent_stream(
+            server_req,
+            agent,
+            f"project:{project_id}:{thread_id}",
+            knowledge=sources,
+            comparison=comparison,
+        )
+        return EventSourceResponse(
+            record_stream(events, store, project_id, thread_id, newest.model_dump(), active)
+        )
+    except KeyError as exc:
+        active.discard(thread_id)
+        raise HTTPException(404, "资料已删除，请重新选择") from exc
+    except BaseException:
+        active.discard(thread_id)
+        raise

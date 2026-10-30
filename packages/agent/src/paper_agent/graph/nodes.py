@@ -30,9 +30,19 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 from paper_agent.graph.state import AgentState
+from paper_agent.knowledge import (
+    NO_SOURCE_MESSAGE,
+    ComparisonReviewError,
+    comparison_review_messages,
+    knowledge_comparison,
+    knowledge_guard,
+    knowledge_messages,
+    knowledge_sources,
+    reviewed_comparison,
+)
 from paper_agent.routing.decision_model import RouteInput
 from paper_agent.routing.guard import guard_from
 
@@ -89,6 +99,18 @@ def make_route_node(router: Any) -> AgentNode:
             query=_last_human_text(list(state["messages"])),
             ui_context=state.get("ui_context") or {},
         )
+        # Explicit server-bound retrieval is outside the classifier's six-intent vocabulary.
+        if knowledge_sources() is not None:
+            guard = knowledge_guard(request.query)
+            return {
+                "intent": "knowledge_qa",
+                "guard": guard,
+                "needs_clarify": guard == "clarify",
+                "path_deep": False,
+                "route_source": "knowledge",
+                "route_confidence": 1.0,
+                "route_from_cache": False,
+            }
         decisions = await router.decide(request)
         return {
             "intent": decisions.intent,
@@ -120,7 +142,37 @@ def make_guard_node(message: str) -> AgentNode:
     return emit
 
 
-def make_agent_node(model: object, *, system_prompt: str | None = None) -> AgentNode:
+def _complete_tool_history(messages: list[BaseMessage]) -> list[BaseMessage]:
+    completed: list[BaseMessage] = []
+    pending: dict[str, str] = {}
+    for message in messages:
+        if isinstance(message, ToolMessage):
+            pending.pop(message.tool_call_id, None)
+        else:
+            # Cancellation can checkpoint a tool call without its result.
+            completed.extend(
+                ToolMessage(
+                    content="工具执行已中断，未收到结果。",
+                    tool_call_id=call_id,
+                    name=name,
+                    status="error",
+                )
+                for call_id, name in pending.items()
+            )
+            pending.clear()
+            if isinstance(message, AIMessage):
+                pending.update((call["id"], call["name"]) for call in message.tool_calls)
+        completed.append(message)
+    return completed
+
+
+def make_agent_node(
+    model: object,
+    *,
+    system_prompt: str | None = None,
+    knowledge_model: object | None = None,
+    comparison_model: object | None = None,
+) -> AgentNode:
     """Build the `agent` node around an already-tool-bound model.
 
     The binding happens outside, in build_graph's caller. Two reasons, one
@@ -145,7 +197,35 @@ def make_agent_node(model: object, *, system_prompt: str | None = None) -> Agent
     prefix = [SystemMessage(content=system_prompt)] if system_prompt else []
 
     async def call_model(state: AgentState) -> dict[str, object]:
-        response = await model.ainvoke(prefix + list(state["messages"]))  # type: ignore[attr-defined]
+        sources = knowledge_sources()
+        if sources is not None:
+            if not sources:
+                return {"messages": [AIMessage(content=NO_SOURCE_MESSAGE)]}
+            if knowledge_model is None:
+                raise RuntimeError("knowledge model is not configured")
+            comparing = knowledge_comparison() is not None
+            if comparing and comparison_model is None:
+                raise ComparisonReviewError()
+            try:
+                response = await knowledge_model.ainvoke(  # type: ignore[attr-defined]
+                    prefix + knowledge_messages(list(state["messages"]), sources)
+                )
+                if comparing:
+                    review = await comparison_model.ainvoke(  # type: ignore[attr-defined]
+                        prefix
+                        + comparison_review_messages(list(state["messages"]), sources, response)
+                    )
+                    response = AIMessage(content=reviewed_comparison(review, sources))
+            except ComparisonReviewError:
+                raise
+            except Exception as exc:
+                if comparing:
+                    raise ComparisonReviewError() from exc
+                raise
+        else:
+            response = await model.ainvoke(  # type: ignore[attr-defined]
+                prefix + _complete_tool_history(list(state["messages"]))
+            )
         return {"messages": [response]}
 
     return call_model

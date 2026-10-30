@@ -12,6 +12,7 @@ dependencies = [
     # not import them directly; it only calls paper_agent.storage.make_*.
     "paper-agent",
     "sse-starlette>=2.1",
+    "pypdf==6.21.2",
 ]
 
 # D3 adds: langchain-openai, langfuse

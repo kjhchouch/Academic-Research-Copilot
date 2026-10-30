@@ -498,6 +498,55 @@ D3 验收时 Langfuse 的 `totalCost` 恒为 0，本来打算去后台建一个 
 
 ---
 
+## 2026-10-22 · D8 · L0 边界 guard 接入图（route 节点 + refuse/clarify 首类出口）
+
+**做了什么**
+
+把 D4 遗留两个 devlog 的「`Decisions` 还没接进 `AgentState`」真正落地，并补上 `decision_model.py` 一直缺的**第三态**。两个 commit：
+
+- `650c01d` vendor 第 7 个 skill `nature-writing`（77 文件，与上游 `19be8d4` 逐字节一致；PROVENANCE / NOTICE 更新 + 一段「辅助不代写」边界条件）。
+- `03b2caf` D8 主体：图从 `START → agent` 改为 `START → route → 条件边(_guard_edge) → {proceed: agent | clarify | refuse}`，`refuse`/`clarify` → END；ReAct 核（`agent → tools → agent`）一字未动。
+
+源码改动（`git show --stat` 实测，11 文件 +962/−47）：
+
+- `routing/guard.py`（新，166 行）—— **L0 确定性边界门**：三族正则（`evasion` 降重/检测规避、`ghostwriting` 整篇代写、`scraping` 版权抓取）+ `guard_from(decisions, request) → proceed|clarify|refuse` 纯函数 + 两段固定文案 `REFUSE_MESSAGE` / `CLARIFY_MESSAGE`。
+- `graph/state.py` —— 加 7 个 `NotRequired` 字段（`intent / guard / needs_clarify / path_deep / route_source / route_confidence / route_from_cache`）。`guard` 是唯一被图本身分支读的，其余搭车好让网关发一条完整 `route` 事件、trace 能把决策归因到后端/置信度/缓存命中。
+- `graph/nodes.py` —— `make_route_node(router)`（调 `router.decide`，写 `Decisions` + `guard_from` 判定，**从不调 chat 模型、不 bind 工具**）+ `make_guard_node(message)`（发一条固定 `AIMessage` 即 END）。
+- `graph/builder.py` —— `_guard_edge` 纯函数 + `router=None` 退回裸 ReAct 环。
+- `api/routes/chat.py` —— 新 `route` SSE 事件（稳定形状、缺省 null）；`refuse`/`clarify` 的固定文案复用既有 `token` 事件。
+- `api/main.py`（+74）—— `_build_router`（无 key → None → 裸环）、shutdown `aclose`、`/health` 增 `routing` 块。
+- `paper_agent/testing.py` —— `ScriptedRouter`（记录 `calls`，测试用假路由）。
+
+测试净增 **36 条**（实测 collected）：`test_routing_guard.py` 27（8 个 def，对 36 条语料参数化 + `guard_from` 纯函数）、`test_graph_routing.py` 6（三条出口 + `ui_context` 转发 + 无 router 回退）、`test_api.py` 3 条 SSE（proceed 形状 / **refuse 证明模型泄漏被 L0 覆盖** / clarify）。
+
+**坑 / 判断**
+
+1. ★ **`guard` 这个字段的全部意义，是把 `decision_model.py` 里被揉成一团的 `unclear` 拆回两种完全不同的东西。** 评测语料里有两行都路由到 `unclear`：「帮我把这段降重」（**不做**——无论怎么改措辞都不做，是原则问题）和「在吗」（**没判断出来**——一句澄清就能解决）。`Decisions` 单凭 `intent` 分不清该回哪一种。`guard` 就是那个缺的字段：它把「won't」和「couldn't」分开，于是 `refuse` 和 `clarify` 才能是**两个不同的图出口**，而不是一句含糊的「请重说」。
+2. ★★ **L0 覆盖模型，而这正是特性，不是缺陷。** `guard_from` 先跑边界正则、**在原始 query 上跑、无视 `intent`**，只有 query 干净才去问 `decisions`。所以路由把「帮我把这段降重」误判成 `polish` 时，`guard_from` 照样返回 `refuse`。把话说白：**对这些正则覆盖的措辞，guard 层的边界泄漏为零，与模型准确率无关**——模型可以判错，边界仍然守住。这是比任何准确率数字都强的断言，也是它做成**图里的门**而不是**提示词里的一句话**的唯一理由：提示词里的「不要代写」是模型能被下一句巧妙话术劝退的建议，一条把降重路由到固定拒绝串的图边不是。`test_a_boundary_query_is_refused_and_the_agent_never_runs` 用一个**故意泄漏 `polish` 的 ScriptedRouter** 端到端钉住这件事：断言 `route.guard=="refuse"` 而 `route.intent=="polish"`、正文 == `REFUSE_MESSAGE`、那句泄漏的 agent 回复不出现、事件名里没有 `tool`。
+3. ★ **路由是图里的一个节点，不是网关的前置步骤；而且转移是纯函数。** `route` 节点确实调模型后端（概率性），但**出它的边 `_guard_edge` 是读 `state["guard"]` 这个普通值的纯函数**——和 `tools_condition` 读最后一条消息的 `tool_calls` 同构。决策是概率的，**转移不是**：一旦 `route` 写下 guard 值（被缓存、被评测打分），同一个值永远走同一条边，所以这里每条转移都可复现、可打分。这就是它和「每一跳都问模型 next?」的 Supervisor 的区别——也是为什么 `refuse`/`clarify` 用**映射字典**而不是裸条件边：一个没映射到的值会在 invoke 时抛错，而不是悄悄挑一个默认出口。
+4. ★ **`router=None` → 裸 ReAct 环，这一条同时是向后兼容和本地优先启动。** `_build_router` 在 `llm_api_key` 和 `typesafe_api_key` **都没有**时返回 None，`build_graph` 就编译成没有路由前导的 `START → agent`。两个后果都是要的：(a) 每个 pre-D4 的图测试都是这么建图的，616 全绿即「没回归」的硬证据；(b) 零外部服务也能启动、产品照样答。**降级后端是便宜的 chat 模型（`llm_chat_model` = deepseek-flash）不是推理模型**——路由是个小的结构化分类。所以只要 agent 本身能跑（有 `llm_api_key`），路由就靠降级档单独开着；Jev 的 key 只**升级主档**，它缺席不是「什么都不路由」的理由。今天运行时正是这个状态：`jev routing disabled: TYPESAFE_API_KEY not configured`，走 small_llm。
+5. **残余缺口不可约，我们不藏。** 正则抓的是**显式**措辞。一个铁了心的用户说「让这段更像原创」、里头一个关键词都没有，在文本层就和「润色他自己写的散文」无法区分——没有任何分类器（规则的或模型的）能可靠分开这两者。所以 L0 **不是**「滥用不可能」的断言，**是**「被明说的边界违规会被确定性拒绝，一切含糊的都降级到 `clarify`（问），绝不降级到 `proceed`（凭猜测行动）」的断言。
+6. **高精度、窄。一次误拒比一次漏拒更糟。** 每条正则都对着整个 `packages/evals/data/routing.jsonl` 校过：必须在诚信行上开火、在别的行上一个都不开火。约束最紧的是 ghostwriting 族——`帮我把第二章整章写出来，数据我已经跑完了` 是一条**合法**的 `draft_section`：**整章**（带着作者自己的数据）不是**整篇**，下面没有一条正则匹配它。漏掉的用例仍会安全降级（模型判 `unclear` → 用户拿到 `clarify`，不是被代写的论文）；误拒则会挡掉一个合法请求。方向不对称，所以宁可窄。
+7. **`boundary_violation` 只在 query 上跑，不在 `ui_context.selected_text` 上跑。** 指令活在用户**打进来**的那句话里，选区是他们的**内容**、不是指令。把选区也扫进去意味着：一段用户正要润色的文字里**引用**了一个边界词，就能把门触发——这是我们此刻不想要的误报。（扫选区是个可能的扩展，但得先解决这个。）
+8. **`refuse`/`clarify` 发的是 `AIMessage` 不是裸字符串，好让 `add_messages` 把它记进 thread。** 于是对话历史里显示「助手拒绝了」，下一轮会把这次拒绝当**真实历史**回放，而不是让模型从头重新发现一遍边界。且因为**不调模型**，回复逐字节相同——这正是让边界可审计、让拒绝无法被争辩的东西。
+9. **`route` SSE 事件：形状稳定、每个字段都在、缺的是 null。** 前端 transport 对未知事件名是**忽略**而不是报错，所以「后端先加、前端后跟」不崩（D2 就预留了这条）。**但要说清今天可见的 D8 效果是 refuse/clarify 的行为，不是一个 route chip**——前端还没渲染这个事件，它是纯后端的加法。
+10. **`_guard_edge` 对未知/缺失 guard 兜底到 `clarify` 是纯防御**（`route` 跑过就不可能发生），且是安全方向：一个我们没能分类的请求被要求重说，绝不会被悄悄放进 agent。在未知 guard 上路由到 `agent` 会把一个记账 bug 变成一次边界绕过。
+11. ★ **`nature-writing` 的边界条件，和刚落地的 guard 是同一件事的两面。** 它是 7 个 vendored skill 里**唯一**上游范围（「full manuscript argument」整篇论证）**超出**「辅助不代写」的。PROVENANCE 里写明：在一个 skill loader 让它可达**之前**，路由必须**收窄到 section 级、要求作者自带论点/数据**，且 L0 必须拒整篇/降重。**它现在 vendored-but-unreachable（没有 loader）**——所以现在 vendor 它恰恰是安全的，而刚落地这道 guard 正是「将来有 loader 时让它继续安全」的机制。两件事不是凑巧同一天，是同一道边界的上游（skill 内容）和下游（路由门）。
+12. **PROVENANCE 的数字自查（又一次「文档里的数字也要测」，呼应 D4 坑 17）。** 提交前抓到两处：「14 unique refs」和「13 refs」读起来自相矛盾（其实是**七个目录去重 14 / nature-writing 目录内 13**，两个口径），以及「1403 KB」是**估的**（996+407）不是量的。实测真值后改成：14 unique across 7 dirs / 13 within nature-writing / 42 occurrences / 2 new；体积从 `du` 的 1387 KB（**块大小相关、不可复现**）换成**逐字节 apparent size 875 KB（896,001 字节）并标注口径**。混口径的计数拆开写、能复现的口径优先——这是既有那条 feedback 的直接应用。
+
+**当前门禁**：**616 passed / 1 skipped / ~16.5s**（D7 收尾 579，本次净增 36 条 routing/guard 测试 + vendored_skills 随第 7 个 skill 增长）；`ruff check` 全绿；`ruff format --check` **63 files already formatted（全树）**。启动实测：后端 `routing: on`（small_llm 降级档，jev 因无 `TYPESAFE_API_KEY` 停用）、MCP `literature-search connected: 3 tool(s)`、Langfuse 接受、checkpoint sqlite；前端 Next 16.4.0 `GET /` → 200。
+
+**仍未做**
+
+- **skill loader（step ②/③）**：`intent → skill` 映射表 + 把 `nature-writing` 的 `always_load` 注入到 section 级边界条件之后 + 沙箱化的 `read_skill_file` 工具。设计已交付，等放行。**兄弟目录硬约束现在是 7 个目录 / 14 条 unique `../nature-shared` 引用**（此前 checklist 写的 6/12 已过时，见下方更新）——loader 落地时这是硬约束，目录一变深，12+ 条相对引用会在 **prompt 组装期**静默失效（不报错，只掉质量）。
+- **`routing.jsonl` 仍 36 条**（< 100 是 pytest skip，不是红 CI）。要长就刻意长，别撞数。
+- **D4 在线验收（#24）仍卡在 `TYPESAFE_API_KEY`**：今天路由跑在 small_llm 降级档（deepseek-flash），jev 停用。800ms 超时能否真触发、Langfuse 里 Jev 的延迟/token、真实准确率，三件事都要真 key。
+- **`route` SSE 事件是纯后端**：前端 transport 忽略它，还没有可见的 route chip。要画出来是另一件前端活。
+- **30 秒 demo 仍阻塞**（in-app browser 表面 `visibilityState=hidden`，无法录屏）。
+- **三把 key 仍待轮换**（DeepSeek / Langfuse / OpenAlex，都在聊天里明文发过一次）。
+
+---
+
 - [x] ~~装 Docker Desktop~~ → **不需要了**，存储已本地化；Docker 留给 Week 4 部署
 - [x] ~~申请 Semantic Scholar API key（无 key 配额低到没法开发）~~ → **D5 没有靠它落地**：主力换成 **OpenAlex**（无 key 可用），Semantic Scholar 保留为按标识符路由的第二上游，代码与测试都写完了，没 key 时直接不启用。**实测无 key 的 S2 第一个请求就 429**，所以它降级为「有了更好」（它提供引用图谱与 field-of-study 过滤）。此行此前写的是「CrossRef / arXiv 无需 key」——那讲的是 `nature-academic-search` 那套 skill 的数据源，**不是 D5 实际实现的东西**，特此更正。
 - [x] ~~**D5 的 live 验收挂起**~~ → **已通过（2026-10-19）**：用户自己申请了免费 `OPENALEX_API_KEY`（免费档 $1/天，是无 key $0.10/天的 10×）填进 `.env`、重启网关，真跑 `search_papers` 返回真论文——45 条 `citation` 全带有效 DOI，模型引用其中 5 篇（CPC/MoCo/SimCLR/SupCon/SwAV），`markers_without_citation=[]`，grounding-by-construction 在真数据上成立。无 key 那两次 429（`retryAfter` 66013 / 45972）留作降级证据。详见本日 D6 devlog。
@@ -510,15 +559,15 @@ D3 验收时 Langfuse 的 `totalCost` 恒为 0，本来打算去后台建一个 
 - [ ] **给别人用之前必须给 Langfuse 挂 `mask=` 钩子。** 一条 trace 含完整 prompt/completion，开 Cloud 等于用户未发表的手稿出境。这是上线门禁，不是优化项；Week 4 自托管的真正理由也在这。
 - [ ] **Week 2 若加 human-in-the-loop interrupt，`tracer_callbacks` 必须改成 per-`thread_id` 一个 handler**：v5 的 `_pending_resume_trace_contexts` 是实例级的，per-request 新建会让跨请求的 resume 断链。session 分组不受影响。
 - [ ] routing.jsonl 目前 **36 条**（D4 从 24 加到 36），D7 要凑满 100 条 —— **每天随手追加，别攒到最后编**（现在少于 100 会显示成一条 pytest skip，不是红 CI）。**种子语料已找到**：本机 `nature-suite/SKILL.md` 的关键词表列了 9 类意图 + 中英触发词，抄分类不抄机制。**新增 `expect_deep` 字段**（快慢路径标签，此前零覆盖），带两条门禁：deep 行必须写 note 说明为什么重、boundary 行不许声明 path。
-- [ ] **skill loader 必须保持 `skills/third_party/` 下六个目录互为兄弟**，否则 12 条 `../nature-shared/*.md` 引用会在 prompt 组装期静默失效（不报错，只掉质量）。D6 实现 loader 时这是硬约束。
+- [ ] **skill loader 必须保持 `skills/third_party/` 下七个目录互为兄弟**，否则 14 条 unique `../nature-shared/*.md` 引用会在 prompt 组装期静默失效（不报错，只掉质量）。实现 loader 时这是硬约束。**（口径更新：D8 vendor `nature-writing` 后从 6 目录 / 12 引用 变为 7 目录 / 14 unique 引用，其中 nature-writing 目录内 13 条、42 处出现、2 条是它新带进树的——见本日 D8 与 `PROVENANCE.md`。）**
 - [ ] **`nature-statistics` 与 `nature-social-science` 是上游 Draft 级**，却分别是「处理数据」和「提供思路」的主力。要用就得补，改动逐条记进 `skills/third_party/PROVENANCE.md` 的修改日志（Apache-2.0 §4(b)）。
 - [ ] 数字保真度 KPI：`nature-shared/scripts/check_consistency.py`（272 行纯 stdlib）是现成参考实现，Verifier 节点可以直接借鉴其 `Finding` 结构，**零 LLM 成本**。
 - [x] ~~整个仓库零测试~~ → **D1 收尾补齐：101 passed / 1 skipped，0.9s**。四个测试文件覆盖 storage / config / API 契约 / routing 数据，并当场抓到 `Path("..").name == ".."` 那个真 bug（见坑 13）。
 - [ ] `apps/web/agents.md` 是 `next dev` 自动生成并会自己加回来的，**别当成自己的改动删掉**（删了只会变成未提交改动，提交了反而脏）。
-- [x] ~~**D3 之前先给 SSE 协议加事件**：`route` / `tool` / `citation`~~ → **`tool` 在 D3 落地，`citation` 在 D6 落地**（网关从工具真返回的论文分配 `citation_id`、注入回工具结果，前端渲染成 `[n]` chip + 参考文献面板）。`route` 仍等 D4 意图路由接进图。前端 transport 对未知事件名是忽略而不是报错，所以后端可以先加、前端后跟。
+- [x] ~~**D3 之前先给 SSE 协议加事件**：`route` / `tool` / `citation`~~ → **三个都落地了**：`tool` 在 D3、`citation` 在 D6（网关从工具真返回的论文分配 `citation_id`、注入回工具结果，前端渲染成 `[n]` chip + 参考文献面板）、**`route` 在 D8**（`intent/guard/needs_clarify/path_deep/source/confidence/from_cache`，稳定形状、缺省 null）。前端 transport 对未知事件名是忽略而不是报错，所以 `route` 是**纯后端加法、前端还没渲染 chip**——今天可见的 D8 效果是 refuse/clarify 行为，不是 route chip。
 - [x] ~~**Week 3 前要决定向量检索走哪条路**~~ → **已定：本地全 SQLite**（`sqlite-vec` + FTS5 `bm25()` + RRF），部署时换 pgvector。见坑 11。
 - [x] ~~`.env` 已从 example 生成，API key 还是空的~~ → **DeepSeek key 已接入并实测通过**（见坑 12）。`CHECKPOINT_BACKEND=sqlite`。
 - [ ] **DeepSeek 余额只剩 ¥3.14（2026-10-14 实测）**。日常开发够用（flash 档单次工具调用约 500 token），但 Week 4 的评测套件（100 条 routing × 多轮 + grounding 逐 claim 蕴含校验）会很紧张，**跑评测前先充值**。
 - [ ] **轮换 DeepSeek key、Langfuse key、OpenAlex key**：三把都在聊天里明文发过一次，已落进本地 transcript。`.env` 里那几份能用（`.env` 已确认未被 git 跟踪），但都该到控制台重签。DeepSeek 泄露的是付费额度，Langfuse 泄露的是**全部 trace 的读权限——里面是完整 prompt 和用户文本**，后者优先级最高；OpenAlex 只是免费 $1/天额度，优先级最低。
 - [ ] TypeSafe(Jev) / Semantic Scholar 两个 key 仍为空。TypeSafe 只卡 D4 的**在线验收**；Semantic Scholar 只卡「引用图谱那一层更好的详情」。两者的代码与离线测试都已完成。**OpenAlex 已填并 live 验证通过（2026-10-19，免费 $1/天档）；Langfuse 已填。**
-- [ ] **D4 的 `Decisions` 尚未接进 `AgentState`。** `graph/state.py` 的 docstring 里预留了 `intent / slots / missing_slots / guard / route_source` 五个字段——**D6 没有做这件事**（D6 聚焦 MCP 接线 + citation + 前端）。现在加就是无人读的字段，每个都要进 checkpoint。`route` SSE 事件同理（前端对未知事件名是忽略而非报错，所以后端可以先加）。留到把 D4 级联真正接进图的那一步一起做。
+- [x] ~~**D4 的 `Decisions` 尚未接进 `AgentState`**~~ → **D8 落地**（2026-10-22）。`graph/state.py` 现有 7 个 `NotRequired` 路由字段：`intent / guard / needs_clarify / path_deep / route_source / route_confidence / route_from_cache`，由 `route` 节点一起写；图读 `guard` 分支到 `proceed/clarify/refuse`，网关读其余发一条完整 `route` 事件。**注意口径**：docstring 早先预留的是 `intent / slots / missing_slots / guard / route_source` 五个——实际接进来的是上面七个，`slots / missing_slots` **仍未加**（没有节点读它们：`needs_clarify` 是单个 bit、clarify 文案是固定的；等文案要「按具体缺哪个 slot 生成」而不是「列全部选项」时它们才挣得位置）。`route` SSE 事件同批落地（见上一条）。

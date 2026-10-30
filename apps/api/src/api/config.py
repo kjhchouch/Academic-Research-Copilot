@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     blob_backend: str = "local"  # local | s3
     sqlite_path: str = "data/checkpoints.sqlite"
     storage_dir: str = "data/blobs"
+    workspace_sqlite_path: str = "data/workspace.sqlite"
 
     database_url: str = "postgresql://postgres:postgres@localhost:5432/agent"
     redis_url: str = "redis://localhost:6379/0"

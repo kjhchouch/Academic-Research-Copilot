@@ -24,3 +24,64 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+button, select, input, textarea, summary {
+  color-scheme: dark;
+}
+
+button:not(:disabled), summary {
+  cursor: pointer;
+}
+
+button:disabled, select:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+:focus-visible {
+  outline: 2px solid #60a5fa;
+  outline-offset: 3px;
+}
+
+* {
+  scrollbar-width: none;
+}
+
+*::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+.chat-scrollbar {
+  position: absolute;
+  inset: 12px 2px 12px auto;
+  width: 20px;
+  color: #52525b;
+  cursor: pointer;
+  touch-action: none;
+  user-select: none;
+}
+
+.chat-scrollbar::before,
+.chat-scrollbar::after {
+  content: "";
+  position: absolute;
+  inset: 0 6px;
+  background: repeating-linear-gradient(to bottom, currentColor 0 2px, transparent 2px 20px);
+}
+
+.chat-scrollbar::after {
+  color: #a1a1aa;
+  clip-path: inset(var(--scroll-top) 0 var(--scroll-bottom) 0);
+}
+
+.chat-scrollbar:hover,
+.chat-scrollbar:focus-visible {
+  color: #71717a;
+}
+
+.chat-scrollbar:focus-visible {
+  border-radius: 4px;
+  outline-offset: -2px;
+}

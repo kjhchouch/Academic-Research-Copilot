@@ -41,11 +41,68 @@ from paper_agent.tools import TOOLS
 
 client = TestClient(app)
 
+
+def test_comparison_uses_configured_reviewer_without_tools(monkeypatch):
+    import api.main as main_module
+    from pydantic import SecretStr
+
+    calls = []
+    models = []
+    captured = {}
+
+    class Model:
+        def bind_tools(self, tools):
+            return (self, tools)
+
+    def make_model(**kwargs):
+        calls.append(kwargs)
+        model = Model()
+        models.append(model)
+        return model
+
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        main_module.settings.model_copy(
+            update={
+                "llm_api_key": SecretStr("synthetic-test-key"),
+                "llm_chat_model": "draft-model",
+                "llm_reasoning_model": "review-model",
+            }
+        ),
+    )
+    monkeypatch.setattr(main_module, "make_chat_model", make_model)
+    monkeypatch.setattr(main_module, "build_graph", lambda **kwargs: captured.update(kwargs))
+    main_module._build_graph(None, ["test-tool"])
+    assert [call["model"] for call in calls] == ["draft-model", "review-model"]
+    assert captured["knowledge_model"] is models[0]
+    assert captured["comparison_model"] is models[1]
+    assert captured["model"] == (models[0], ["test-tool"])
+    assert calls[1]["max_retries"] == 0
+
+
 # What the scripted model says after the tool runs. Chinese, and long enough to
 # be split across several chunks at chunk_size=4, which is what makes
 # "chunked not buffered" a real assertion rather than a tautology.
 FINAL_REPLY = "共 13 个中文字符，未超出常见期刊摘要的字数上限。"
 TOOL_ARG_TEXT = "本研究采用多层线性模型分析。"
+
+
+@pytest.fixture(autouse=True)
+def isolated_storage(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import api.main as main_module
+
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        main_module.settings.model_copy(
+            update={
+                "workspace_sqlite_path": str(tmp_path / "workspace.sqlite3"),
+                "sqlite_path": str(tmp_path / "checkpoints.sqlite3"),
+                "storage_dir": str(tmp_path / "storage"),
+            }
+        ),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -1090,12 +1147,20 @@ def test_cors_header_present_on_a_streaming_response() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_lifespan_builds_every_backend() -> None:
+def test_lifespan_builds_every_backend(tmp_path) -> None:
     """Backends are built in lifespan, not at import time, so a misconfigured
     CHECKPOINT_BACKEND fails at startup instead of on the first user request.
     This test is what makes that claim true.
     """
+    import api.main as main_module
+
+    assert main_module.settings.workspace_sqlite_path == str(tmp_path / "workspace.sqlite3")
+    assert main_module.settings.sqlite_path == str(tmp_path / "checkpoints.sqlite3")
+    assert main_module.settings.storage_dir == str(tmp_path / "storage")
     with TestClient(app) as c:
+        assert app.state.workspace.path == tmp_path / "workspace.sqlite3"
+        assert app.state.workspace.blob_dir == tmp_path / "storage" / "workspace"
+        assert app.state.workspace.list_projects() == []
         assert c.get("/health").status_code == 200
         assert app.state.cache is not None
         assert app.state.blobs is not None
