@@ -268,6 +268,9 @@ def _route_event(update: dict[str, Any] | None) -> dict[str, str] | None:
     the same rule as `_citation_payload`, so the frontend types the event once.
     Keyed off `guard` rather than `intent` because `guard` is the field the graph
     actually branched on; if it is absent this is not a route update at all.
+
+    `skill`（D10）是 additive 的一次形状扩展：本意图命中的 vendored skill 名或
+    null。transport 对未知键宽容（JSON 对象多一个键），已发布的前端不需要改动。
     """
     fields = update or {}
     if "guard" not in fields:
@@ -282,6 +285,7 @@ def _route_event(update: dict[str, Any] | None) -> dict[str, str] | None:
             "source": fields.get("route_source"),
             "confidence": fields.get("route_confidence"),
             "from_cache": fields.get("route_from_cache"),
+            "skill": fields.get("skill"),
         },
     )
 

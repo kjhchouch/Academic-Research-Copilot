@@ -2,6 +2,7 @@ import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,6 +12,7 @@ from paper_agent.grounding import L0OnlyBackend, SmallLLMEntailment
 from paper_agent.llm import make_chat_model
 from paper_agent.observability import make_tracer, shutdown_tracer, verify_tracer
 from paper_agent.routing import make_router
+from paper_agent.skill_loader import SkillCatalog
 from paper_agent.storage import make_blob_store, make_cache, make_checkpointer
 from paper_agent.tools import (
     TOOLS,
@@ -18,6 +20,7 @@ from paper_agent.tools import (
     MCPToolBridge,
     StdioServerSpec,
     assert_unique_tool_names,
+    make_read_skill_file_tool,
 )
 
 from api.config import Settings, get_settings
@@ -180,6 +183,7 @@ def _build_graph(
     tools: list[object],
     router: object | None = None,
     entailment: object | None = None,
+    skill_catalog: object | None = None,
 ) -> object | None:
     """Compile the Fast Path graph, or return None when there is no credential.
 
@@ -190,9 +194,9 @@ def _build_graph(
     /health's key_present explain why -- and it lets the test suite run the whole
     HTTP contract with no credentials at all.
 
-    `router` and `entailment` are threaded straight through to `build_graph`;
-    when either is None the corresponding preamble/postamble is absent (see
-    `_build_router` and `_build_entailment`).
+    `router`, `entailment` and `skill_catalog` are threaded straight through to
+    `build_graph`; when one is None the corresponding preamble/postamble/mapping
+    is absent (see `_build_router`, `_build_entailment` and the lifespan log).
     """
     if not settings.llm_api_key:
         return None
@@ -221,6 +225,7 @@ def _build_graph(
         checkpointer=checkpointer,
         router=router,
         entailment=entailment,
+        skill_catalog=skill_catalog,
     )
 
 
@@ -258,9 +263,21 @@ async def lifespan(app: FastAPI):
     # Held on app.state for one reason only: aclose() has to run in this same task,
     # which is the one that entered it (see MCPToolBridge's docstring).
     app.state.mcp = await _connect_literature(settings)
+    # D10 skill 可达性。目录缺失降级为 reachable=0（/health 可见），不 fail 启动——
+    # 但 read_skill_file 工具仍注册：模型得到诚实的「vendor 目录缺失」错误文本，
+    # 而不是一个凭空消失的工具。
+    app.state.skills = SkillCatalog(Path(settings.skills_dir)) if settings.skills_enabled else None
+    logger.info(
+        "skills: %s",
+        f"on ({app.state.skills.reachable}/3 reachable)"
+        if app.state.skills is not None
+        else "off (disabled)",
+    )
     tools = list(TOOLS)
     if app.state.mcp is not None:
         tools.extend(app.state.mcp.tools)
+    if app.state.skills is not None:
+        tools.append(make_read_skill_file_tool(app.state.skills.files))
     # Checked at composition time rather than left to ToolNode, which indexes tools
     # by name and would let one source silently shadow the other. Raising here does
     # orphan the child for a moment, but a stdio server exits when its stdin
@@ -290,7 +307,11 @@ async def lifespan(app: FastAPI):
         else f"{settings.grounding_backend} (L0 deterministic marking only)",
     )
     app.state.graph = _build_graph(
-        app.state.checkpointer, tools, router=app.state.router, entailment=app.state.entailment
+        app.state.checkpointer,
+        tools,
+        router=app.state.router,
+        entailment=app.state.entailment,
+        skill_catalog=app.state.skills,
     )
     app.state.tracer = make_tracer(
         public_key=settings.langfuse_public_key,
@@ -406,6 +427,15 @@ async def health() -> dict:
         "grounding": {
             "configured": isinstance(getattr(app.state, "entailment", None), SmallLLMEntailment),
             "backend": settings.grounding_backend,
+        },
+        # D10 skill 可达性：enabled 是配置值；reachable 是映射表里的 skill 在磁盘上
+        # 真实存在的数量（3 = 全部可达）。0 且 enabled=True 说明 vendor 目录丢了——
+        # 这正是「skill 静默失效」要在 /health 上可见而不是靠输出质量倒推的理由。
+        "skills": {
+            "enabled": settings.skills_enabled,
+            "reachable": (
+                skills.reachable if (skills := getattr(app.state, "skills", None)) else 0
+            ),
         },
         # Tool names and a connected flag, straight from describe(): no env, no
         # command line, no upstream URLs. "The agent never searches" is otherwise

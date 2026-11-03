@@ -87,7 +87,7 @@ def _last_human_text(messages: list[Any]) -> str:
     return ""
 
 
-def make_route_node(router: Any) -> AgentNode:
+def make_route_node(router: Any, skill_catalog: Any = None) -> AgentNode:
     """Build the `route` node around a router (a `ResilientRouter` in production).
 
     Typed as `Any` for the same reason as the model in `make_agent_node`: the node
@@ -101,6 +101,10 @@ def make_route_node(router: Any) -> AgentNode:
     the L0 boundary check on the raw query *before* consulting the decision, the
     integrity boundary still refuses an explicit "降重" even when every backend is
     down and the decision is the static one.
+
+    `skill_catalog` 把意图映射到 vendored skill（D10）：映射是静态表，写进 `skill`
+    字段随决策一起落 state——网关发 route 事件、agent 节点注入 pack，都从这里取。
+    映射失败（词汇表漂移等）返回 None 而不是抛：skill 是增强，不是路由的前提。
     """
 
     async def route(state: AgentState) -> dict[str, object]:
@@ -119,8 +123,10 @@ def make_route_node(router: Any) -> AgentNode:
                 "route_source": "knowledge",
                 "route_confidence": 1.0,
                 "route_from_cache": False,
+                "skill": None,
             }
         decisions = await router.decide(request)
+        skill = skill_catalog.skill_for_intent(decisions.intent) if skill_catalog else None
         return {
             "intent": decisions.intent,
             "guard": guard_from(decisions, request),
@@ -129,6 +135,7 @@ def make_route_node(router: Any) -> AgentNode:
             "route_source": decisions.source,
             "route_confidence": decisions.confidence,
             "route_from_cache": decisions.from_cache,
+            "skill": skill.name if skill else None,
         }
 
     return route
@@ -233,6 +240,7 @@ def make_agent_node(
     system_prompt: str | None = None,
     knowledge_model: object | None = None,
     comparison_model: object | None = None,
+    skill_catalog: object | None = None,
 ) -> AgentNode:
     """Build the `agent` node around an already-tool-bound model.
 
@@ -254,8 +262,20 @@ def make_agent_node(
     Storing it would write it into every checkpoint -- once per turn, forever --
     and would put mutable per-request text ahead of the stable prefix that
     prompt caching keys on.
+
+    `skill_catalog`（D10）：意图命中映射时，把 SKILL.md + always_load 组成的 skill
+    pack 作为第二条 SystemMessage 注入——位置固定在 system prompt 之后、历史之前，
+    pack 字节只随意图变化，所以同一意图的多轮对话缓存照常命中。确定性注入，不靠
+    模型自觉去读：D8 警告的「prompt 组装期静默失效」不允许在这里发生。知识问答
+    路径不叠 skill——它有自己的二阶段审核与来源契约。
     """
     prefix = [SystemMessage(content=system_prompt)] if system_prompt else []
+
+    def _skill_pack(state: AgentState) -> SystemMessage | None:
+        if skill_catalog is None:
+            return None
+        pack = skill_catalog.pack_for_intent(state.get("intent"))
+        return SystemMessage(content=pack) if pack else None
 
     async def call_model(state: AgentState) -> dict[str, object]:
         sources = knowledge_sources()
@@ -284,8 +304,9 @@ def make_agent_node(
                     raise ComparisonReviewError() from exc
                 raise
         else:
+            pack = _skill_pack(state)
             response = await model.ainvoke(  # type: ignore[attr-defined]
-                prefix + _complete_tool_history(list(state["messages"]))
+                prefix + ([pack] if pack else []) + _complete_tool_history(list(state["messages"]))
             )
         return {"messages": [response]}
 

@@ -98,6 +98,7 @@ def build_graph(
     knowledge_model: Any = None,
     comparison_model: Any = None,
     entailment: Any = None,
+    skill_catalog: Any = None,
 ) -> Any:
     """Compile the Fast Path graph.
 
@@ -120,6 +121,13 @@ def build_graph(
     and the graph is byte-for-byte what it was before D9. The verify node reads
     the per-request CitationRegistry through its ContextVar, so nothing about the
     registry needs to touch the graph or the state schema.
+
+    `skill_catalog` gates D10 reachability: `route` maps intent → skill and
+    writes `state["skill"]`, `agent` injects the SKILL.md + always_load pack as
+    the second SystemMessage. Catalog here does not imply a router — but with
+    neither router nor knowledge model there is no intent signal at all, so a
+    bare loop ignores the catalog by construction (no `intent` in state →
+    `pack_for_intent(None)` → None).
     """
     graph = StateGraph(AgentState)
     graph.add_node(
@@ -129,6 +137,7 @@ def build_graph(
             system_prompt=system_prompt,
             knowledge_model=knowledge_model,
             comparison_model=comparison_model,
+            skill_catalog=skill_catalog,
         ),
     )
     graph.add_node("tools", ToolNode(tools))
@@ -136,7 +145,7 @@ def build_graph(
     if router is None and knowledge_model is None:
         graph.add_edge(START, "agent")
     else:
-        graph.add_node("route", make_route_node(router))
+        graph.add_node("route", make_route_node(router, skill_catalog))
         graph.add_node("refuse", make_guard_node(REFUSE_MESSAGE))
         graph.add_node("clarify", make_guard_node(CLARIFY_MESSAGE))
         if router is None:

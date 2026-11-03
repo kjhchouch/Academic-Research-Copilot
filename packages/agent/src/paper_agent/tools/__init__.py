@@ -15,6 +15,7 @@ from paper_agent.tools.mcp import (
     StdioServerSpec,
     assert_unique_tool_names,
 )
+from paper_agent.tools.skill_files import make_read_skill_file_tool
 
 __all__ = [
     "TOOLS",
@@ -23,4 +24,5 @@ __all__ = [
     "StdioServerSpec",
     "assert_unique_tool_names",
     "count_words",
+    "make_read_skill_file_tool",
 ]

@@ -35,7 +35,7 @@ graph TD
 
     RAG["检索层<br/>混合检索 BM25+向量 → RRF → rerank → 质量自评重试"]
     GND["Grounding<br/>claim → span 绑定 → 蕴含校验 → supported/uncertain/contradicted"]
-    SK["Skill 系统<br/>三级渐进披露 · agentskills.io 格式"]
+    SK["Skill 系统<br/>D10 已接入：3 skill 可达（映射+注入+read_skill_file）"]
     MCP["MCP 工具<br/>literature-search · pdf-parse · citation-format"]
     MEM["记忆层<br/>session state + compaction · FTS+向量双路召回"]
     OBS["Langfuse<br/>全链路 trace · eval"]
@@ -265,9 +265,23 @@ CI 门禁：修改任何 `SKILL.md` 的 frontmatter 或路由 prompt，必须跑
 - **`supported` / `uncertain` / `contradicted`** —— claim（含标记的句段）× span（该论文的**摘要**）批量蕴含校验，一次调用判完整条答案；无引用轮次零开销。fail-open 方向钉死：核验超时/解析失败 → 全部 `uncertain`，**绝不 `contradicted`**——服务中断必须表现为「无法核验」，不是「引用是假的」。
 
 grounding eval（24 条起步，g1 用 OpenAlex fixture 的真实摘要、其余为标注过的合成 span，
-中文 claim × 英文 span 正是生产里的真实语言分布）：**离线 harness 已建，live 数字待跑**
-——需要读 `.env` 的 key 打外部服务，按 D7 先例等明文授权。
-`--task grounding --backend small_llm`（降级档；生产档是 Jev 蕴含，同卡 `TYPESAFE_API_KEY`）。
+中文 claim × 英文 span 正是生产里的真实语言分布）：
+
+| 指标 | 2026-11-03 live 实测（`small_llm` 降级档，deepseek-flash） |
+|---|---|
+| 三类 verdict P/R | supported/uncertain/contradicted 各 **1.000**（24/24） |
+| 危险方向泄漏率 | **0/13** |
+| Citation Precision / Recall | **1.000 / 1.000** |
+| 后端错误 | 0 |
+
+复现：`uv run python -m evals --task grounding --backend small_llm`（读 `LLM_API_KEY`；
+生产档是 Jev 蕴含，同卡 `TYPESAFE_API_KEY`）。
+
+> **这个 100% 和路由那个 100% 读法相同：是「语料已饱和」的诊断，不是生产分。**
+> 两个前提连着读：(1) `by_backend={"small_llm": 24}`——降级档的数字不能当 Jev 的；
+> (2) 24 条构造语料全对说明样本还不够难（缺：更长的 claim、需要跨句推理的 span、
+> 真实产品答案的端到端标注）。让数字开始有意义的方向是扩语料 + 对真实答案做
+> 人工标注的 live 评测，不是庆祝满分。
 
 ---
 
@@ -325,6 +339,24 @@ vendored 自 [Nature Skills](https://github.com/Yuan1z0825/nature-skills)（Apac
 
 **Skill 是知识，不是能力。** 路由、grounding、评测三件事必须无可争议是自研的——
 一个 skill 包替代不了它们，本项目也不允许把它当作替代品。
+
+### 可达性（D10）
+
+loader 已接入运行时（`paper_agent/skill_loader/`，`SKILLS_ENABLED` 可整体关闭）：
+
+| intent | skill | 注入内容 |
+|---|---|---|
+| `polish` | nature-polishing | SKILL.md + always_load（≈19K chars） |
+| `draft_section` | nature-writing | 同上（≈28K chars）+ **收窄包装**：章节级、须用户自带论点/数据、声明优先于上游内容 |
+| `outline` | nature-writing | 同上 |
+| `citation_format` | nature-ref-verifier | 同上（≈11K chars）；格式化本身仍走 MCP 的确定性工具 |
+
+`literature_search`/`unclear`/知识问答不注入 skill。**刻意不可达**：`nature-response`、
+`nature-statistics`、`nature-social-science`（词汇表没有对应意图——`data_analysis` 等
+进词汇表后，映射表加一行即可达）；`nature-shared` 只作兄弟引用被间接读取。按需的
+references/fragments 由模型用 `read_skill_file` 工具读取（路径沙箱：vendor root 内、
+仅 `.md/.yaml/.tex`、永不执行也永不读取 `.py`）。映射表是本项目对「哪个意图需要哪类
+知识」的判断，改动记 devlog。
 
 ### 三道门禁
 

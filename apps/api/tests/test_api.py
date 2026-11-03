@@ -506,6 +506,10 @@ def test_route_event_carries_the_whole_decision() -> None:
         "source": "jev",
         "confidence": 0.91,
         "from_cache": False,
+        # D10 additive：本意图命中的 vendored skill 名。test_api.py 的桩图不接
+        # skill catalog（那是 main lifespan 的装配），所以这里是 null——字段存在
+        # 且为 null 本身就是契约的一部分（「每个字段都在，缺的是 null」）。
+        "skill": None,
     }
     # proceed means the ReAct core still ran and its reply still streamed.
     assert tokens(events) == FINAL_REPLY

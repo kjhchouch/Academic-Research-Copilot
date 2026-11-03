@@ -86,6 +86,14 @@ class AgentState(TypedDict):
     route_confidence: NotRequired[float]
     route_from_cache: NotRequired[bool]
 
+    # --- D10 skill 可达性 ------------------------------------------------------
+    # `route` 节点写：本意图命中的 vendored skill 名（INTENT_SKILLS 映射），无映射为
+    # None。`agent` 节点读 intent + 这里的 skill 语义（经 catalog）把 SKILL.md +
+    # always_load 注入为第二条 SystemMessage；网关把 skill 名带进 route 事件，让前端
+    # 和 trace 都知道这轮的答案是在哪个 skill 的知识下工作。knowledge_qa 恒 None——
+    # 资料问答有自己的二阶段审核，不叠 skill。
+    skill: NotRequired[str | None]
+
     # --- D9 grounding 标注 ----------------------------------------------------
     # `verify` 节点写。`grounding` 每项是 {citation_id, verdict, reason}，verdict 取
     # paper_agent.grounding.VERDICTS 四值之一；`grounding_source` 记录判定来自哪个

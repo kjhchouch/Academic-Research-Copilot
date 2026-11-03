@@ -81,6 +81,13 @@ class Settings(BaseSettings):
     # 单批蕴含调用的上限。超时按 fail-open 处理（全部 uncertain），绝不抛给流。
     grounding_timeout_ms: int = 8000
 
+    # --- D10 skill loader ---------------------------------------------------
+    # 把 vendored skill（skills/third_party）接入运行时：intent→skill 映射、
+    # SKILL.md+always_load 注入、read_skill_file 工具。enabled=False 时三者全关。
+    # vendor 目录缺失是可降级事实（/health 的 skills.reachable 可见），不是错误。
+    skills_enabled: bool = True
+    skills_dir: str = "skills/third_party"
+
     # --- Literature MCP server -------------------------------------------
     # These are forwarded into the literature-search child process, and they are
     # the *only* thing that reaches it. `stdio_client` gives a spawned server

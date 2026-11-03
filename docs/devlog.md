@@ -637,6 +637,135 @@ already formatted。
 
 ---
 
+## 2026-11-03 · D10 · Skill loader 落地：7 个 vendored skill 从 unreachable 到 3 个可达
+
+**做了什么**
+
+D8 留下的「vendored-but-unreachable」解除。spec 与计划：
+[specs/2026-11-02-skill-loader-design.md](superpowers/specs/2026-11-02-skill-loader-design.md) +
+[plans/2026-11-02-skill-loader.md](superpowers/plans/2026-11-02-skill-loader.md)。
+（D8 devlog 说 loader「设计已交付，等放行」——那份设计只在对话里，本 spec 是它第一次落盘。）
+
+- `paper_agent/skill_loader/`：`files.py`（路径级沙箱：绝对/反斜杠/逃逸/保留名/扩展名
+  白名单 {md,yaml,tex}/100K cap；`.py` 明确拒读——白名单门禁守「不被执行」，这里守
+  「不被读取」）；`catalog.py`（`INTENT_SKILLS` 静态映射 + pack 确定性组装 + 40K 体积
+  门禁）。
+- **可达三件事**：`route` 节点写 `state["skill"]`（映射是配置不是模型选择）；
+  `agent` 节点把 SKILL.md + manifest `always_load` 组成的 pack 注入为第二条
+  SystemMessage（system prompt 之后、历史之前——pack 字节只随意图变，同意图多轮
+  缓存照常命中）；`read_skill_file` 工具做 on_demand 渐进披露（永不 raise，错误文本
+  带出路线索）。
+- 映射 v1：`polish→nature-polishing`、`draft_section→nature-writing`（带收窄包装：
+  章节级 + 须用户自带论点/数据，声明优先于上游内容）、`outline→nature-writing`、
+  `citation_format→nature-ref-verifier`。**刻意不可达**：response/statistics/
+  social-science（词汇表没有对应意图，D4 明确不贪多）、shared（自述不可独立调用）。
+  实测 pack 体积：writing 27.6K / polishing 19.4K / ref-verifier 11.4K chars。
+- 网关：`SKILLS_ENABLED`/`SKILLS_DIR`；`read_skill_file` 在 `assert_unique_tool_names`
+  之前注册（vendor 缺失也注册——模型得到诚实的错误文本，不是凭空消失的工具）；
+  `route` 事件 additive 第八键 `skill`；`/health` 增 `skills: {enabled, reachable}`。
+- **vendored 树零改动**：git status 里 `skills/` 无一文件变动，NOTICE 的 verbatim
+  声明继续为真（ruff 的 force-exclude 门禁原样全绿）。
+
+**坑 / 判断**
+
+1. ★ **`..` 一刀切拒绝会杀掉合法的兄弟引用。** 第一版沙箱把「路径含 `..` 段」直接拒
+   ——测试当场红在 `nature-writing/../nature-shared/core/ethics.md`：manifest 的
+   always_load 里有 14 条这样的引用，是 skill 设计的**合法主用例**。真正的 invariant
+   不是「路径里没有 `..`」，是「resolve 之后仍在 vendor root 内」——
+   `nature-polishing/../../Windows/win.ini` 由包含性检查拦下，兄弟引用照常通过。
+   先想清楚 invariant 再写校验，校验才是少而不是多。
+2. ★ **「文件被 linter 改过 → 编辑重放」漏掉了函数签名。** main.py 在 D9 收尾被 ruff
+   format 改过；本次两组编辑第一组因「file modified」失败，重放时我只重放了
+   docstring+body 段、漏了签名段——`skill_catalog` 参数没加上，函数体引用它直接
+   `NameError`。7 个失败测试里 5 个都是这一个 NameError 的下游（lifespan 全家）。
+   教训：编辑冲突后的重放必须**整段**重放，逐段核对签名。
+3. **注入 vs 模型自觉读，选注入。** always_load 的定义就是「对每个 job 都适用」的
+   stance/workflow/ethics——交给模型用工具去读，等于把 D8 警告过的「prompt 组装期
+   静默失效」换了个入口（模型忘了调工具 = 不报错、只掉质量）。pack 确定性 + 位置
+   固定让缓存兜住重复轮次：首个映射轮多 1-2s prefill，此后命中。**on_demand 才走
+   工具**——那是 skill 自己设计的两级加载，我们不发明第二套。
+4. **catalog=None / disabled / vendor 缺失三种状态必须分开。** disabled → 无 catalog
+   无工具；vendor 缺失 → catalog 在（reachable=0，/health 可见）、无 pack、工具仍注册
+   （错误文本诚实）。混淆任何两个都会造出「工具在但知识不在」的半死状态。
+5. **route 事件加字段要连旧断言一起升级。** D8 的 `test_route_event_carries_the_whole_
+   decision` 是精确相等断言；additive 的 `skill: null` 让它红——这是契约扩展的正确
+   代价，改断言时注释写明「null 也是契约的一部分」（无 catalog 的桩图里字段存在且为
+   null）。
+6. **收窄文本要覆盖同一 skill 的两个意图。** nature-writing 同时服务 draft_section 与
+   outline，收窄措辞写成「章节级的规划或起草辅助」，两边都成立——一条 SkillSpec.
+   narrowing，不做 per-intent 变体（YAGNI）。
+7. **映射表与词汇表交叉测试**沿用 routing 的 INTENTS/eval 双清单纪律：词汇表一收缩
+   而表没跟上，可达性静默漂移——`test_intent_mapping_keys_are_within_the_vocabulary`
+   钉住。
+
+**当前门禁**：**1041 passed / 1 skipped / 45.97s**（D9 收尾 987 → +54：files 17 ·
+catalog 10 · 工具 10 · 图 6 · API 3 · 其余为 D9 遗留文件的 format 重排后计数）；
+`ruff check` 全绿；`ruff format --check` **96 files** already formatted；`git status
+skills/` 空。
+
+**仍未做**
+
+- **优先级清单只剩 #2：Deep Path 最小版**（section 级 drafter + verifier，别一次搭
+  五节点）——用户三项清单的最后一项。
+- ~~**live 验证一轮真实润色/起草请求**~~ → **已完成（见下方 D10 补充）**：pack 注入
+  （5,008/6,741 tokens、prefill 2.4-9.7s）、模型按 manifest 跑轴检测、on_demand 定向
+  触发 8 次 read_skill_file 全部合法命中。需要 DeepSeek 余额（¥3.14 早就该充了）与授权。
+- live grounding eval 授权（D9 遗留，命令在 D9 devlog）。
+- 前端渲染 route 事件的 `skill` 字段与 grounding 事件（后端先行先例不变）。
+- Jev 蕴含后端 / `data_analysis` 等意图扩张后 statistics、social-science、response
+  的可达化（路径 = 映射表加一行）。
+- 三把 key 轮换（D8 遗留）。
+
+---
+
+## 2026-11-03 · D10 补充 · live 验收（用户授权 + 充值后）：pack 注入、on_demand 读取、grounding eval 全部真跑
+
+用户明文授权（「你自己来」+ 已充值 DeepSeek）。三个验收项全部拿到真证据：
+
+**1. pack 注入与路由（3 个真实请求，真 small_llm 路由 + 真 DeepSeek-flash）**
+
+| 轮次 | 路由 | pack | prefill |
+|---|---|---|---|
+| polish（润色一句空泛结论） | `polish` → nature-polishing | 20,556 chars / **5,008 tokens** | 2.4s |
+| draft_section（MoCo 采样策略） | `draft_section` → nature-writing | 28,382 chars / **6,741 tokens** | 5.7-6.2s |
+| draft_section（引言起草） | `draft_section` → nature-writing | 28,406 chars / 6,745 tokens | 9.7s |
+
+- **模型真的在按 skill 工作，不是礼貌性收到**：draft 轮的回答开头就是「检测到的轴值：
+  task=manuscript，paper_type=algorithmic，section=method，language=zh-to-en」——
+  它在执行 manifest 的 axes 检测；两轮起草都带 **Claim-evidence map**（Status: needs
+  evidence）， ethics.md 的纪律透出来了；润色轮拒绝给空泛句子镀金、要求数据，与
+  「辅助不代写」边界一致。
+- **延迟账**：首个映射轮 prefill 2.4-9.7s（引言轮输出 1,205 tokens 最长）；与 spec 的
+  估计一致。生产里同意图多轮有 prompt cache 兜底，此处是冷启动口径。
+
+**2. on_demand 读取：3 轮常规请求没触发，定向查询一轮 8 次全对**
+
+- 常规润色/起草轮模型**没有**调 `read_skill_file`——回答从 pack（SKILL.md +
+  always_load）就够撑住。这不是缺陷：skill 自己的设计就是「always_load 够用，on_demand
+  按条件取」；机制离线已测，触发与否是模型的按需判断。
+- **定向验证**：问「想看引言写法范例」（命中 manifest on_demand 的 examples 条件）→
+  模型**连调 8 次** `read_skill_file`：`manifest.yaml`（重读地图）→
+  `references/examples/index.md` → `introduction-examples.md` →
+  `static/fragments/section/intro.md` → 4 个具体范例文件，全部合法命中、零沙箱拒绝；
+  回答按范例库的 4 段漏斗 + 变体分类组织。渐进披露在真实模型上成立。
+
+**3. grounding eval live（D9 遗留清零）**
+
+`uv run python -m evals --task grounding --backend small_llm`，24 行 / 6 组 / 0 后端错误：
+三类 verdict P/R 全 **1.000**，**泄漏 0/13**，Citation Precision / Recall **1.000**。
+`by_backend={"small_llm": 24}`——**与路由 36 条满分同一个读法：语料饱和的诊断，不是
+生产分**（降级档不是 Jev；24 条构造语料缺长 claim、跨句推理 span、真实答案端到端标注）。
+README 已把数字连着两条前提写进「引用标注」节。
+
+**成本**：live 脚本未接 pricing 逐轮对账（一次性验收脚本不装表）；量级按 token 估
+≈ 3 万输入 tokens，几分钱以内——但「没对账」就是没对账，别引用具体数字。
+
+**临时脚本已删**（`_live_skill_check*.py` / `_run_grounding_eval.py`）；复现命令已写进
+README 与本条目。剩余待办不变：Deep Path 最小版（清单最后一项）、Jev 蕴含档、前端
+渲染 skill/grounding、扩语料。
+
+---
+
 - [x] ~~装 Docker Desktop~~ → **不需要了**，存储已本地化；Docker 留给 Week 4 部署
 - [x] ~~申请 Semantic Scholar API key（无 key 配额低到没法开发）~~ → **D5 没有靠它落地**：主力换成 **OpenAlex**（无 key 可用），Semantic Scholar 保留为按标识符路由的第二上游，代码与测试都写完了，没 key 时直接不启用。**实测无 key 的 S2 第一个请求就 429**，所以它降级为「有了更好」（它提供引用图谱与 field-of-study 过滤）。此行此前写的是「CrossRef / arXiv 无需 key」——那讲的是 `nature-academic-search` 那套 skill 的数据源，**不是 D5 实际实现的东西**，特此更正。
 - [x] ~~**D5 的 live 验收挂起**~~ → **已通过（2026-10-19）**：用户自己申请了免费 `OPENALEX_API_KEY`（免费档 $1/天，是无 key $0.10/天的 10×）填进 `.env`、重启网关，真跑 `search_papers` 返回真论文——45 条 `citation` 全带有效 DOI，模型引用其中 5 篇（CPC/MoCo/SimCLR/SupCon/SwAV），`markers_without_citation=[]`，grounding-by-construction 在真数据上成立。无 key 那两次 429（`retryAfter` 66013 / 45972）留作降级证据。详见本日 D6 devlog。
@@ -649,7 +778,7 @@ already formatted。
 - [ ] **给别人用之前必须给 Langfuse 挂 `mask=` 钩子。** 一条 trace 含完整 prompt/completion，开 Cloud 等于用户未发表的手稿出境。这是上线门禁，不是优化项；Week 4 自托管的真正理由也在这。
 - [ ] **Week 2 若加 human-in-the-loop interrupt，`tracer_callbacks` 必须改成 per-`thread_id` 一个 handler**：v5 的 `_pending_resume_trace_contexts` 是实例级的，per-request 新建会让跨请求的 resume 断链。session 分组不受影响。
 - [ ] routing.jsonl 目前 **36 条**（D4 从 24 加到 36），D7 要凑满 100 条 —— **每天随手追加，别攒到最后编**（现在少于 100 会显示成一条 pytest skip，不是红 CI）。**种子语料已找到**：本机 `nature-suite/SKILL.md` 的关键词表列了 9 类意图 + 中英触发词，抄分类不抄机制。**新增 `expect_deep` 字段**（快慢路径标签，此前零覆盖），带两条门禁：deep 行必须写 note 说明为什么重、boundary 行不许声明 path。
-- [ ] **skill loader 必须保持 `skills/third_party/` 下七个目录互为兄弟**，否则 14 条 unique `../nature-shared/*.md` 引用会在 prompt 组装期静默失效（不报错，只掉质量）。实现 loader 时这是硬约束。**（口径更新：D8 vendor `nature-writing` 后从 6 目录 / 12 引用 变为 7 目录 / 14 unique 引用，其中 nature-writing 目录内 13 条、42 处出现、2 条是它新带进树的——见本日 D8 与 `PROVENANCE.md`。）**
+- [x] ~~**skill loader 必须保持 `skills/third_party/` 下七个目录互为兄弟**~~ → **D10 落地**（2026-11-03，见本日条目）。约束原样生效且更重了：catalog 的 pack 组装要按 manifest 读 `../nature-shared/...` 兄弟引用，目录一变深，pack 里的 always_load 会出现「缺失，未加载」占位行（可见但质量掉）——磁盘完整性由 `test_shared_sibling_references_resolve` 继续看守，运行时只求缺失可辨。**（口径不变：7 目录 / 14 unique 引用，见 D8 与 `PROVENANCE.md`。）**
 - [ ] **`nature-statistics` 与 `nature-social-science` 是上游 Draft 级**，却分别是「处理数据」和「提供思路」的主力。要用就得补，改动逐条记进 `skills/third_party/PROVENANCE.md` 的修改日志（Apache-2.0 §4(b)）。
 - [ ] 数字保真度 KPI：`nature-shared/scripts/check_consistency.py`（272 行纯 stdlib）是现成参考实现，Verifier 节点可以直接借鉴其 `Finding` 结构，**零 LLM 成本**。
 - [x] ~~整个仓库零测试~~ → **D1 收尾补齐：101 passed / 1 skipped，0.9s**。四个测试文件覆盖 storage / config / API 契约 / routing 数据，并当场抓到 `Path("..").name == ".."` 那个真 bug（见坑 13）。
@@ -659,6 +788,6 @@ already formatted。
 - [x] ~~`.env` 已从 example 生成，API key 还是空的~~ → **DeepSeek key 已接入并实测通过**（见坑 12）。`CHECKPOINT_BACKEND=sqlite`。
 - [ ] **DeepSeek 余额只剩 ¥3.14（2026-10-14 实测）**。日常开发够用（flash 档单次工具调用约 500 token），但 Week 4 的评测套件（100 条 routing × 多轮 + grounding 逐 claim 蕴含校验）会很紧张，**跑评测前先充值**。
 - [ ] **轮换 DeepSeek key、Langfuse key、OpenAlex key**：三把都在聊天里明文发过一次，已落进本地 transcript。`.env` 里那几份能用（`.env` 已确认未被 git 跟踪），但都该到控制台重签。DeepSeek 泄露的是付费额度，Langfuse 泄露的是**全部 trace 的读权限——里面是完整 prompt 和用户文本**，后者优先级最高；OpenAlex 只是免费 $1/天额度，优先级最低。
-- [ ] **grounding eval 的 live run 待授权（D9）**：`uv run python -m evals --task grounding --backend small_llm`——读 `.env` 的 `LLM_API_KEY` 打 DeepSeek，按 D7 先例需要用户明文同意。语料 24 条起步（g1 是 OpenAlex fixture 的真实摘要，其余合成 span 已在 note 标注来源）；要长就刻意长，别凑数。生产档是 Jev 蕴含，卡 `TYPESAFE_API_KEY`（与 D4 在线验收同源）。前端渲染 `grounding` 事件是另一件活（`route` chip 先例：后端先行）。
+- [x] ~~**grounding eval 的 live run 待授权（D9）**~~ → **已跑（2026-11-03，用户授权 + 充值后）**：24 行 / 6 组 / 0 后端错误，三类 verdict P/R 全 1.000、泄漏 0/13、Citation P/R 1.000——**语料饱和的诊断不是生产分**（降级档 small_llm 不是 Jev；缺长 claim / 跨句 span / 真实答案端到端标注）。数字连前提写进了 README「引用标注」节；见 D10 补充。
 - [ ] TypeSafe(Jev) / Semantic Scholar 两个 key 仍为空。TypeSafe 只卡 D4 的**在线验收**；Semantic Scholar 只卡「引用图谱那一层更好的详情」。两者的代码与离线测试都已完成。**OpenAlex 已填并 live 验证通过（2026-10-19，免费 $1/天档）；Langfuse 已填。**
 - [x] ~~**D4 的 `Decisions` 尚未接进 `AgentState`**~~ → **D8 落地**（2026-10-22）。`graph/state.py` 现有 7 个 `NotRequired` 路由字段：`intent / guard / needs_clarify / path_deep / route_source / route_confidence / route_from_cache`，由 `route` 节点一起写；图读 `guard` 分支到 `proceed/clarify/refuse`，网关读其余发一条完整 `route` 事件。**注意口径**：docstring 早先预留的是 `intent / slots / missing_slots / guard / route_source` 五个——实际接进来的是上面七个，`slots / missing_slots` **仍未加**（没有节点读它们：`needs_clarify` 是单个 bit、clarify 文案是固定的；等文案要「按具体缺哪个 slot 生成」而不是「列全部选项」时它们才挣得位置）。`route` SSE 事件同批落地（见上一条）。
