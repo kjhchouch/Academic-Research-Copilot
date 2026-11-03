@@ -1,10 +1,10 @@
 """Graph nodes.
 
-Three nodes, one shape. Each `make_*_node` is a factory returning a closure
+Four nodes, one shape. Each `make_*_node` is a factory returning a closure
 rather than a module-level function, because a node needs something the graph does
-not (a model, a router, a fixed message) and LangGraph nodes take exactly one
-argument -- the state. The factory is the seam that lets a test pass a scripted
-double and production pass the real thing.
+not (a model, a router, a fixed message, an entailment backend) and LangGraph nodes
+take exactly one argument -- the state. The factory is the seam that lets a test
+pass a scripted double and production pass the real thing.
 
 The nodes:
 
@@ -15,6 +15,10 @@ The nodes:
     refuse / clarify
             terminal exits built by `make_guard_node`. Emit a fixed message and
             end the graph.
+    verify  the D9 marking pass. Reads the final answer plus the per-request
+            CitationRegistry, writes `grounding` verdicts to state -- and nothing
+            else: no messages, no tokens, no model call of its own beyond the
+            entailment backend.
 
 `route` and the guard exits do not call the chat model, and that is load-bearing:
 a boundary that a model produced can be argued with by the next cleverly-worded
@@ -27,12 +31,15 @@ is reproducible even though the decision behind it was not.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
+from paper_agent.citations import current_registry
 from paper_agent.graph.state import AgentState
+from paper_agent.grounding.verify import verify_answer
 from paper_agent.knowledge import (
     NO_SOURCE_MESSAGE,
     ComparisonReviewError,
@@ -45,6 +52,8 @@ from paper_agent.knowledge import (
 )
 from paper_agent.routing.decision_model import RouteInput
 from paper_agent.routing.guard import guard_from
+
+logger = logging.getLogger(__name__)
 
 # The bound model is a Runnable, not a BaseChatModel: production passes
 # `ChatOpenAI(...).bind_tools(TOOLS)` and tests pass a scripted fake. Typing it
@@ -140,6 +149,58 @@ def make_guard_node(message: str) -> AgentNode:
         return {"messages": [AIMessage(content=message)]}
 
     return emit
+
+
+def _last_assistant_text(messages: list[Any]) -> str:
+    """The newest assistant turn's text, or "" if there is none.
+
+    `verify` runs immediately after `agent`, so the last AIMessage is the answer
+    this turn produced -- on a warm thread the checkpointed history is behind it.
+    """
+    for message in reversed(messages):
+        if (
+            isinstance(message, AIMessage)
+            and isinstance(message.content, str)
+            and message.content.strip()
+        ):
+            return message.content
+    return ""
+
+
+def make_verify_node(entailment: Any) -> AgentNode:
+    """Build the D9 `verify` node around an `EntailmentBackend` (or None).
+
+    只写 state，不发消息：`grounding` 进 SSE 事件和 checkpoint，但核验结论不是对话
+    的一部分——把它写成 AIMessage 会让下一轮把「引用 X 被标为 contradicted」当作
+    历史喂回模型，而模型该看到的是自己的原答案。
+
+    两个跳过条件，各有各的理由：资料问答路径自带二阶段审核（`[K1]` 引用也不在
+    标记正则的口径里，这里是双保险）；registry 未绑定意味着根本不在一次聊天轮里
+    （citations 是流的增强，不是前提——bind_citations 的同一哲学）。
+
+    `entailment=None` 时仍做 L0：unbacked 与 span 缺失是确定性信号，不需要模型
+    （GROUNDING_BACKEND=off 退到这一层，见 verify.py）。节点整体 try/except 是
+    最后的保险：verify_answer 已经把后端失败折叠成 uncertain，这里兜的是它自己
+    意料之外的错——核验永远不掀翻一条已经答完的流。
+    """
+
+    async def verify(state: AgentState) -> dict[str, object]:
+        if knowledge_sources() is not None:
+            return {}
+        answer = _last_assistant_text(list(state["messages"]))
+        try:
+            judgements = await verify_answer(answer, current_registry(), entailment)
+        except Exception:  # noqa: BLE001 - grounding must never break a finished stream
+            logger.exception("grounding verify failed; skipping marking for this turn")
+            return {}
+        if not judgements:
+            return {}
+        return {
+            "grounding": [judgement.as_state() for judgement in judgements],
+            "grounding_source": getattr(entailment, "name", None),
+        }
+
+    return verify
 
 
 def _complete_tool_history(messages: list[BaseMessage]) -> list[BaseMessage]:

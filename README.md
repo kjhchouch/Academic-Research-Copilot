@@ -3,7 +3,9 @@
 面向学生的**科研写作辅助** Agent —— 文献检索、综述、大纲、引用管理、润色、修改建议。
 
 > **产品边界**：辅助，不代写。不做整篇代写、不做降重。越界请求会被路由层识别并拒绝。
-> 所有输出强制绑定真实文献 span，未获支持的引用会被标记。
+> 每个引用号都过引用标注层（D9）：以工具真返回的论文摘要为依据做蕴含校验，
+> 标注 `supported` / `uncertain` / `contradicted` / `unbacked`（编造的引用号由
+> registry 查表确定性标注，不依赖模型）。页级/句级 span 仍是占位（`SpanRef` 为 null）。
 
 一个用于展示 Agent 工程能力的独立项目：显式状态图编排、引用可信度校验、评测驱动开发、全链路可观测。
 
@@ -219,7 +221,7 @@ docs/
 | 维度 | 指标 |
 |---|---|
 | 意图路由 | Accuracy · Macro-F1 · 各意图召回率 · **false-positive rate** |
-| 引用可信度 | **Citation Precision** · **Citation Recall** |
+| 引用标注（D9） | **Citation Precision** · **Citation Recall** · 三类 verdict P/R · **危险方向泄漏率** |
 | 端到端 | 事实一致性 · 指令遵循 |
 
 ```bash
@@ -228,6 +230,9 @@ uv run --no-sync pytest -q
 
 # 只跑 routing eval
 uv run --package evals pytest packages/evals
+
+# grounding eval（live，读 LLM_API_KEY；--backend 无默认，出处见下）
+uv run python -m evals --task grounding --backend small_llm
 ```
 
 CI 门禁：修改任何 `SKILL.md` 的 frontmatter 或路由 prompt，必须跑 routing eval。
@@ -251,6 +256,18 @@ CI 门禁：修改任何 `SKILL.md` 的 frontmatter 或路由 prompt，必须跑
 
 > **这个 100% 是「语料已饱和」的信号，不是终点，也不是生产路由的分。**
 > 两个必须一起读的前提：**(1)** 这是 `small_llm` 降级后端的分 —— 生产路由是 **Jev**，其数字待 `TYPESAFE_API_KEY`（D4 在线验收项，见 [devlog](docs/devlog.md)）。报告里的 `by_source` 就是为了让降级档的分**永远无法被当成 Jev 的分**，CLI 的 `--backend` 也因此没有默认值。**(2)** 36 条全对，恰恰说明样本还不够难 —— 满分不告诉你路由器在哪失败。真正有价值的数字来自扩到 100 条、补进更多**间接注入** / **意图明确但缺 slot 的歧义句** / **只靠 `ui_context` 才判得出的口语句**之后的**非满分**结果。**一个饱和的 eval 等于没测**，所以「凑满 100 条」不是 KPI 凑数，是让这个数字开始有意义的前提。
+
+### 引用标注：当前状态（D9）
+
+每个 `[n]` 过四值标注（`paper_agent/grounding/`，图里的 `verify` 节点，SSE `grounding` 事件）：
+
+- **`unbacked`** —— 引用号在 registry 里没有条目（模型编的号）。**确定性查表，零模型调用**，`GROUNDING_BACKEND=off` 时也标注。
+- **`supported` / `uncertain` / `contradicted`** —— claim（含标记的句段）× span（该论文的**摘要**）批量蕴含校验，一次调用判完整条答案；无引用轮次零开销。fail-open 方向钉死：核验超时/解析失败 → 全部 `uncertain`，**绝不 `contradicted`**——服务中断必须表现为「无法核验」，不是「引用是假的」。
+
+grounding eval（24 条起步，g1 用 OpenAlex fixture 的真实摘要、其余为标注过的合成 span，
+中文 claim × 英文 span 正是生产里的真实语言分布）：**离线 harness 已建，live 数字待跑**
+——需要读 `.env` 的 key 打外部服务，按 D7 先例等明文授权。
+`--task grounding --backend small_llm`（降级档；生产档是 Jev 蕴含，同卡 `TYPESAFE_API_KEY`）。
 
 ---
 

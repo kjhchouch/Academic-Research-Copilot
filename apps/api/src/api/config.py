@@ -72,6 +72,15 @@ class Settings(BaseSettings):
     decision_model_backend: str = "jev"
     jev_timeout_ms: int = 800
 
+    # --- D9 grounding（引用标注）-------------------------------------------
+    # off | small_llm。small_llm 在配置了 LLM_API_KEY 时启用：对正文含 [n] 的答案
+    # 追加一次批量蕴含调用（无引用的轮次零开销），给每个引用号标注
+    # supported / uncertain / contradicted / unbacked。off 不是全关——unbacked
+    # 查表与 span 缺失是确定性信号，不需要模型（见 paper_agent.grounding.verify）。
+    grounding_backend: str = "small_llm"
+    # 单批蕴含调用的上限。超时按 fail-open 处理（全部 uncertain），绝不抛给流。
+    grounding_timeout_ms: int = 8000
+
     # --- Literature MCP server -------------------------------------------
     # These are forwarded into the literature-search child process, and they are
     # the *only* thing that reaches it. `stdio_client` gives a spawned server

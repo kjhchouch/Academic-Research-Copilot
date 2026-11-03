@@ -14,6 +14,7 @@ The gateway emits its own tiny event vocabulary rather than the Vercel AI SDK's
     event: route   data: {...}               the D4 routing decision for this turn
     event: tool    data: {...}               a tool call started or finished
     event: citation data: {...}              one paper the agent may cite as [n]
+    event: grounding data: {...}             D9 per-citation verdicts for the answer
     event: done    data: {}                  stream finished cleanly
     event: error   data: {"message": "..."}  stream failed; no `done` follows
 
@@ -285,6 +286,40 @@ def _route_event(update: dict[str, Any] | None) -> dict[str, str] | None:
     )
 
 
+def _grounding_event(update: dict[str, Any] | None) -> dict[str, str] | None:
+    """The `verify` node's state update as one `grounding` event, or None.
+
+    Stable shape, same rule as `route` and `citation`: every field present, null
+    when unknown. `source` names the entailment backend wired for this turn
+    (null when none is, i.e. pure L0 marking) -- the same provenance discipline
+    as the routing eval's `by_source`, so a degraded backend's marking can never
+    be read as the production one's.
+
+    Emitted once per turn, after the answer's tokens and before `done`. Absent
+    entirely when the answer cited nothing -- that absence is the frontend's
+    signal that there is nothing to mark, and it is also why turns without
+    citations pay nothing for grounding.
+    """
+    fields = update or {}
+    verdicts = fields.get("grounding")
+    if not verdicts:
+        return None
+    return _event(
+        "grounding",
+        {
+            "verdicts": [
+                {
+                    "citation_id": verdict.get("citation_id"),
+                    "verdict": verdict.get("verdict"),
+                    "reason": verdict.get("reason"),
+                }
+                for verdict in verdicts
+            ],
+            "source": fields.get("grounding_source"),
+        },
+    )
+
+
 def _guard_text_events(update: dict[str, Any] | None) -> list[dict[str, str]]:
     """A `refuse`/`clarify` node's fixed message, streamed as `token` events.
 
@@ -445,6 +480,12 @@ async def _agent_stream(
                                 for event in _guard_text_events(update):
                                     comparison_answer_sent = True
                                     yield event
+                        elif node == "verify":
+                            # D9：核验节点只写 state，事件在 token 之后、done 之前
+                            # 出现一次。答案没有引用时节点不写 state，这里自然是 None。
+                            event = _grounding_event(update)
+                            if event is not None:
+                                yield event
                         for event in _tool_events(node, update):
                             yield event
                     # Drained after each node update, not once at the end: papers

@@ -41,7 +41,12 @@ from typing import Any
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
-from paper_agent.graph.nodes import make_agent_node, make_guard_node, make_route_node
+from paper_agent.graph.nodes import (
+    make_agent_node,
+    make_guard_node,
+    make_route_node,
+    make_verify_node,
+)
 from paper_agent.graph.state import AgentState
 from paper_agent.knowledge import knowledge_sources
 from paper_agent.prompts.system import FAST_PATH_SYSTEM_PROMPT
@@ -72,6 +77,17 @@ def _guard_edge(state: AgentState) -> str:
     return guard if guard in _GUARD_EXITS else "clarify"
 
 
+def _after_agent_edge(state: AgentState) -> str:
+    """`agent` 之后去 `tools` 还是 `verify`。
+
+    `tools_condition` 读最后一条消息有没有 tool_calls（纯函数，同裸环）；没有
+    tool_calls 就是本轮的最终答案，交给 `verify` 做引用标注。与 `_guard_edge` 同一
+    构造：决策（模型要不要工具）是概率的，转移读的是普通值。只在 `entailment`
+    接入时替换 `tools_condition`——`entailment=None` 的图与 D9 之前逐字节相同。
+    """
+    return "tools" if tools_condition(state) == "tools" else "verify"
+
+
 def build_graph(
     *,
     model: Any,
@@ -81,6 +97,7 @@ def build_graph(
     router: Any = None,
     knowledge_model: Any = None,
     comparison_model: Any = None,
+    entailment: Any = None,
 ) -> Any:
     """Compile the Fast Path graph.
 
@@ -96,6 +113,13 @@ def build_graph(
     builds. With a router, `route` runs first and `guard` decides whether the loop
     runs at all. Typed `Any` for the same reason as `model`: the node only calls
     `await router.decide(...)`, and tests pass a scripted fake.
+
+    `entailment` gates the D9 marking pass: with it, the agent's final answer
+    (no tool calls) detours through `verify`, which writes `grounding` verdicts
+    to state and ends; without it the agent edge is exactly `tools_condition`
+    and the graph is byte-for-byte what it was before D9. The verify node reads
+    the per-request CitationRegistry through its ContextVar, so nothing about the
+    registry needs to touch the graph or the state schema.
     """
     graph = StateGraph(AgentState)
     graph.add_node(
@@ -133,10 +157,18 @@ def build_graph(
         graph.add_edge("refuse", END)
         graph.add_edge("clarify", END)
 
-    # tools_condition returns "tools" or END by inspecting the last AIMessage.
-    # No mapping dict: this graph has one possible continuation and inventing a
-    # second would be the Supervisor, which is a different graph.
-    graph.add_conditional_edges("agent", tools_condition)
+    # agent -> tools -> agent is the ReAct loop; a final answer (no tool calls)
+    # detours through `verify` only when an entailment backend is wired. Both
+    # exits are named in a mapping dict: an edge name that is not mapped must
+    # raise at invoke time, not silently pick a default.
+    if entailment is None:
+        graph.add_conditional_edges("agent", tools_condition)
+    else:
+        graph.add_node("verify", make_verify_node(entailment))
+        graph.add_conditional_edges(
+            "agent", _after_agent_edge, {"tools": "tools", "verify": "verify"}
+        )
+        graph.add_edge("verify", END)
     graph.add_edge("tools", "agent")
 
     return graph.compile(checkpointer=checkpointer)

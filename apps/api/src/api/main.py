@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from paper_agent.citations import bind_citations
 from paper_agent.graph import build_graph
+from paper_agent.grounding import L0OnlyBackend, SmallLLMEntailment
 from paper_agent.llm import make_chat_model
 from paper_agent.observability import make_tracer, shutdown_tracer, verify_tracer
 from paper_agent.routing import make_router
@@ -142,8 +143,43 @@ def _build_router(settings: Settings, cache: object) -> object | None:
     )
 
 
+def _build_entailment(settings: Settings) -> object | None:
+    """Compose the D9 grounding backend, or None when it should not run.
+
+    None means "no verify node at all" to `build_graph` and only happens when
+    there is no graph to run grounding on (no `llm_api_key`). `off` is NOT None:
+    it returns `L0OnlyBackend`, which keeps the deterministic half of the marking
+    (unbacked registry misses and missing-abstract citations need no model) while
+    dropping the model call. An unrecognised backend value degrades to L0-only
+    with a warning rather than refusing to boot -- a typo'd env var must not take
+    the gateway down, and /health's `grounding` block is where that stays visible.
+    """
+    if not settings.llm_api_key:
+        return None
+    if settings.grounding_backend == "off":
+        return L0OnlyBackend()
+    if settings.grounding_backend != "small_llm":
+        logger.warning(
+            "unknown GROUNDING_BACKEND %r; falling back to L0-only marking "
+            "(expected off | small_llm)",
+            settings.grounding_backend,
+        )
+        return L0OnlyBackend()
+    model = make_chat_model(
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key.get_secret_value(),
+        model=settings.llm_chat_model,
+        max_tokens=settings.llm_max_tokens,
+        temperature=settings.llm_temperature,
+    )
+    return SmallLLMEntailment(model, timeout=settings.grounding_timeout_ms / 1000)
+
+
 def _build_graph(
-    checkpointer: object, tools: list[object], router: object | None = None
+    checkpointer: object,
+    tools: list[object],
+    router: object | None = None,
+    entailment: object | None = None,
 ) -> object | None:
     """Compile the Fast Path graph, or return None when there is no credential.
 
@@ -154,8 +190,9 @@ def _build_graph(
     /health's key_present explain why -- and it lets the test suite run the whole
     HTTP contract with no credentials at all.
 
-    `router` is threaded straight through to `build_graph`; when it is None the
-    graph has no routing preamble (see `_build_router`).
+    `router` and `entailment` are threaded straight through to `build_graph`;
+    when either is None the corresponding preamble/postamble is absent (see
+    `_build_router` and `_build_entailment`).
     """
     if not settings.llm_api_key:
         return None
@@ -183,6 +220,7 @@ def _build_graph(
         tools=tools,
         checkpointer=checkpointer,
         router=router,
+        entailment=entailment,
     )
 
 
@@ -241,7 +279,19 @@ async def lifespan(app: FastAPI):
     # means the bare ReAct loop with no gate (see _build_router).
     app.state.router = _build_router(settings, app.state.cache)
     logger.info("routing: %s", "on" if app.state.router is not None else "off (bare ReAct loop)")
-    app.state.graph = _build_graph(app.state.checkpointer, tools, router=app.state.router)
+    # Built with the router: both are optional pre/post-ambles around the same
+    # ReAct core. None here means the deterministic marking layer only.
+    app.state.entailment = _build_entailment(settings)
+    model_on = isinstance(app.state.entailment, SmallLLMEntailment)
+    logger.info(
+        "grounding: %s",
+        "on (small_llm)"
+        if model_on
+        else f"{settings.grounding_backend} (L0 deterministic marking only)",
+    )
+    app.state.graph = _build_graph(
+        app.state.checkpointer, tools, router=app.state.router, entailment=app.state.entailment
+    )
     app.state.tracer = make_tracer(
         public_key=settings.langfuse_public_key,
         secret_key=(
@@ -349,6 +399,13 @@ async def health() -> dict:
             "configured": getattr(app.state, "router", None) is not None,
             "backend": settings.decision_model_backend,
             "jev_key_present": bool(settings.typesafe_api_key),
+        },
+        # D9 引用标注：configured 是「模型蕴含在跑吗」（L0OnlyBackend 不算），
+        # backend 是配置值本身——off 时 unbacked / span 缺失的确定性标注仍然生效，
+        # 这个区别靠 backend 字段传达。
+        "grounding": {
+            "configured": isinstance(getattr(app.state, "entailment", None), SmallLLMEntailment),
+            "backend": settings.grounding_backend,
         },
         # Tool names and a connected flag, straight from describe(): no env, no
         # command line, no upstream URLs. "The agent never searches" is otherwise

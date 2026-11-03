@@ -1,7 +1,8 @@
-"""Run the routing eval against one backend and print the report.
+"""Run the routing or grounding eval against one backend and print the report.
 
     uv run python -m evals --backend small_llm
     uv run python -m evals --backend jev --json > docs/routing-eval-jev.json
+    uv run python -m evals --task grounding --backend small_llm
 
 `--backend` is required and has no default, and that is the whole point of this
 file's shape. The production router is Jev; the only backend that can run today
@@ -10,7 +11,9 @@ is the `small_llm` fallback on deepseek-flash, because Jev is blocked on
 to be configured is how a fallback's accuracy ends up in a README described as
 the production router's. Forcing the caller to name the backend, and echoing it
 back in the report with a warning when it is the fallback, keeps the number
-attached to its provenance.
+attached to its provenance. The grounding eval inherits both rules unchanged:
+its production backend is likewise Jev (entailment checking is one of Jev's
+three jobs in the tech-stack table), likewise awaiting the same key.
 
 Backends are imported lazily inside their builders so `--help` and the pure
 report formatting work with no credentials and without pulling langchain-openai
@@ -26,6 +29,10 @@ import os
 from pathlib import Path
 from typing import Any
 
+from evals.grounding import DATA as GROUNDING_DATA
+from evals.grounding import Report as GroundingReport
+from evals.grounding import load_rows as load_grounding_rows
+from evals.grounding import run_eval as run_grounding_eval
 from evals.routing import DATA, Report, load_rows, run_eval
 
 # Which backend is the degraded one. Kept as a set rather than a string so the
@@ -44,21 +51,25 @@ def _require_env(name: str, backend: str) -> str:
     return value
 
 
-def _build_small_llm() -> Any:
+def _build_chat_model() -> Any:
+    """routing 与 grounding 共用的降级档模型——同一个 key、同一个便宜档。"""
     from paper_agent.llm import make_chat_model
-    from paper_agent.routing import SmallLLMBackend
 
-    model = make_chat_model(
+    return make_chat_model(
         base_url=os.environ.get("LLM_BASE_URL", "https://api.deepseek.com"),
         api_key=_require_env("LLM_API_KEY", "small_llm"),
         model=os.environ.get("LLM_CHAT_MODEL", "deepseek-flash"),
         max_tokens=int(os.environ.get("LLM_MAX_TOKENS", "2048")),
         temperature=float(os.environ.get("LLM_TEMPERATURE", "0.2")),
-        # Routing is a single JSON classification with no tool calls and no
-        # follow-up turn, so thinking mode buys nothing and is left disabled --
-        # the same default the chat path uses.
+        # Routing / entailment 都是单轮 JSON 分类，没有工具调用和后续轮次，
+        # thinking mode 买不到任何东西——与聊天路径同一个默认（disabled）。
     )
-    return SmallLLMBackend(model)
+
+
+def _build_small_llm() -> Any:
+    from paper_agent.routing import SmallLLMBackend
+
+    return SmallLLMBackend(_build_chat_model())
 
 
 def _build_jev() -> Any:
@@ -77,7 +88,22 @@ def _build_jev() -> Any:
     return backend
 
 
+def _build_grounding_small_llm() -> Any:
+    from paper_agent.grounding import SmallLLMEntailment
+
+    return SmallLLMEntailment(_build_chat_model())
+
+
+def _build_grounding_jev() -> Any:
+    raise SystemExit(
+        "the Jev entailment backend is not built yet: TYPESAFE_API_KEY's online "
+        "acceptance (D4) is still pending, and the entailment tier will land with "
+        "it. Until then the only runnable grounding backend is small_llm."
+    )
+
+
 _BUILDERS = {"jev": _build_jev, "small_llm": _build_small_llm}
+_GROUNDING_BUILDERS = {"jev": _build_grounding_jev, "small_llm": _build_grounding_small_llm}
 
 
 def _fmt_rate(value: float | None) -> str:
@@ -96,6 +122,16 @@ async def _run(backend: str, rows: list[Any]) -> Report:
         return await run_eval(router, rows)
     finally:
         aclose = getattr(router, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
+async def _run_grounding(backend: str, rows: list[Any]) -> GroundingReport:
+    entailment = _GROUNDING_BUILDERS[backend]()
+    try:
+        return await run_grounding_eval(entailment, rows)
+    finally:
+        aclose = getattr(entailment, "aclose", None)
         if aclose is not None:
             await aclose()
 
@@ -147,26 +183,76 @@ def _print_report(report: Report, backend: str, data_path: Path) -> None:
         )
 
 
+def _print_grounding_report(report: GroundingReport, backend: str, data_path: Path) -> None:
+    line = "-" * 74
+    print(line)
+    print(f"Grounding eval — backend: {backend}")
+    print(f"dataset: {data_path}")
+    print(
+        f"rows: {report.n_rows} in {report.n_answer_groups} answer groups "
+        f"(backend errors: {report.n_errors})"
+    )
+    print(line)
+
+    header = f"{'verdict':<14}{'support':>8}{'pred':>7}{'prec':>8}{'recall':>8}{'f1':>8}"
+    print(header)
+    for label, s in report.per_class.items():
+        print(
+            f"{label:<14}{s.support:>8}{s.predicted:>7}"
+            f"{s.precision:>8.3f}{s.recall:>8.3f}{s.f1:>8.3f}"
+        )
+    print(line)
+
+    print(f"accuracy   {report.accuracy:.4f}")
+    print(f"macro-F1   {report.macro_f1:.4f}")
+    print(
+        f"leakage    {report.leakage.leaked}/{report.leakage.n} "
+        f"({_fmt_rate(report.leakage.rate)})  "
+        "<- predicted 'supported' but ground truth disagrees (the dangerous direction)"
+    )
+    print(
+        f"citation precision {report.citation_precision:.4f}   "
+        f"citation recall {report.citation_recall:.4f}   "
+        "(README 口径：按 answer 组宏平均，从后端判定算——真实产品的端到端数字"
+        "需要对真实答案做 live 评测)"
+    )
+    print(f"by_backend {report.by_backend}")
+    print(line)
+
+    if backend != _PRODUCTION_BACKEND:
+        print(
+            f"NOTE: {backend!r} is a degraded fallback, not the production Jev "
+            "entailment tier.\n      Report this as the fallback's number; the Jev "
+            "number needs TYPESAFE_API_KEY."
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m evals",
-        description="Run the routing eval against one backend and print the report.",
+        description="Run the routing or grounding eval against one backend and print the report.",
         epilog=(
             "Live runs cost real balance (small_llm) or need a TypeSafe key (jev). "
             "The offline metric tests in packages/evals/tests need neither."
         ),
     )
     parser.add_argument(
+        "--task",
+        default="routing",
+        choices=("routing", "grounding"),
+        help="which eval to run (default: routing)",
+    )
+    parser.add_argument(
         "--backend",
         required=True,
         choices=sorted(_BUILDERS),
-        help="which routing backend to grade; no default, so a fallback number "
+        help="which backend to grade; no default, so a fallback number "
         "cannot be produced by accident",
     )
     parser.add_argument(
         "--data",
         default=None,
-        help=f"path to a routing.jsonl (default: the packaged dataset at {DATA})",
+        help="path to the task's jsonl dataset (default: the packaged one)",
     )
     parser.add_argument(
         "--json",
@@ -175,17 +261,33 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    data_path = Path(args.data) if args.data else DATA
-    rows = load_rows(data_path)
+    if args.task == "routing":
+        data_path = Path(args.data) if args.data else DATA
+        report: Any = asyncio.run(_run(args.backend, load_rows(data_path)))
+        if args.json:
+            print(
+                json.dumps(
+                    {"task": "routing", "backend": args.backend, **report.as_dict()},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        _print_report(report, args.backend, data_path)
+        return 0
 
-    report = asyncio.run(_run(args.backend, rows))
-
+    data_path = Path(args.data) if args.data else GROUNDING_DATA
+    report = asyncio.run(_run_grounding(args.backend, load_grounding_rows(data_path)))
     if args.json:
         print(
-            json.dumps({"backend": args.backend, **report.as_dict()}, ensure_ascii=False, indent=2)
+            json.dumps(
+                {"task": "grounding", "backend": args.backend, **report.as_dict()},
+                ensure_ascii=False,
+                indent=2,
+            )
         )
-    else:
-        _print_report(report, args.backend, data_path)
+        return 0
+    _print_grounding_report(report, args.backend, data_path)
     return 0
 
 

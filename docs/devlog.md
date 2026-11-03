@@ -547,6 +547,96 @@ D3 验收时 Langfuse 的 `totalCost` 恒为 0，本来打算去后台建一个 
 
 ---
 
+## 2026-10-31 · D9 · Grounding 标注层落地（L0 unbacked + L1 蕴含）+ 引用评测 harness
+
+**做了什么**
+
+README 第一页的「未获支持的引用会被标记」从空头支票变成代码。spec 与计划走了 superpowers 流程
+（自治模式，用户以「你继续」预授权方向）：
+[specs/2026-10-31-grounding-citation-eval-design.md](superpowers/specs/2026-10-31-grounding-citation-eval-design.md) +
+[plans/2026-10-31-grounding-citation-eval.md](superpowers/plans/2026-10-31-grounding-citation-eval.md)。
+
+- `paper_agent/grounding/`（4 文件）：`claims.py`（答案 → 带引用号的句段，标记正则与前端
+  `textWithChips` 同一条窄规则）；`entailment.py`（`EntailmentBackend` Protocol +
+  `SmallLLMEntailment`——与 `routing/small_llm.py` 同构：裸 JSON 手工解析、`wait_for` 超时、
+  异常折叠、批上限 10 分批串行；外加 `L0OnlyBackend`）；`verify.py`（`verify_answer` 编排：
+  registry 未绑定短路 → unbacked 查表 → span 缺失 → 模型蕴含 → 按 citation_id 聚合取最差）。
+- 词表：`supported` / `uncertain` / `contradicted` / `unbacked`。**unbacked 只有 L0 能产**
+  （模型说 unbacked 一律 coerce 成 uncertain——registry 是网关的，模型在猜它没见过的注册表）。
+- 图：`START → route → {agent | clarify | refuse}` 不动，`agent` 出边在有 entailment 时换成
+  `_after_agent_edge`（`tools_condition` 的组合），最终答案绕经 `verify` 节点——只写 state
+  （`grounding` / `grounding_source` 两个字段），**不发消息**：核验结论进事件流和 checkpoint，
+  不进对话历史。`entailment=None` 的图与 D8 之前逐字节相同（`verify` 不在节点表里）。
+- 网关：`event: grounding`（token 之后、done 之前一次，形状稳定缺省 null）；
+  `GROUNDING_BACKEND=small_llm|off`（默认 small_llm，`off` 保留 L0）+ `GROUNDING_TIMEOUT_MS`；
+  `/health` 增 `grounding` 块。**无引用轮次零开销**：`verify_answer` 无标记直接返回空。
+- 评测：`data/grounding.jsonl` 24 条（g1 用 OpenAlex fixture 的真实 CL4SRec 摘要，其余为
+  note 强制标注来源的合成 span；中文 claim × 英文 span = 生产真实语言分布）+
+  `src/evals/grounding.py`（score 纯函数 + 组驱动 run_eval + by_backend 出处强制）+
+  CLI `--task grounding --backend small_llm`。
+
+**坑 / 判断**
+
+1. ★ **`entailment=None` 有两种含义，测试替我抓住了这个歧义。** 图层的契约是
+   「None → 不接 verify 节点」（保住 D8 之前的图逐字节不变），而网关的 `off` 档要的是
+   「接 verify 但只跑 L0」——两者不能共用一个 None。`L0OnlyBackend` 就是这个歧义的显式化：
+   一个 `judge` 恒空、`name=None` 的载体对象。发现路径：API 测试
+   `test_off_backend_still_marks_unbacked_through_the_gateway` 红了——事件根本没发，
+   因为 None 让 verify 节点压根不存在。
+2. ★ **fail-open 的方向是本设计的不对称核心。** 蕴含后端超时/解析失败/抛异常 → 该批全部
+   `uncertain`（reason=`entailment_unavailable`），**绝不 `contradicted`**：一次核验中断是
+   「无法核验」，不能变成「这引用是假的」——前者损失信息，后者是错误断言。与 routing 的
+   `needs_clarify=True` / `path_deep=False` 是同一条「方向性默认」原则。
+3. **errored 不计泄漏，与 routing 相反——且各自正确。** routing 把 errored 边界行计泄漏
+   （没拒成 = 没守住）；grounding 的 errored 是「没断言」，fail-open 的 uncertain 是安全
+   输出。泄漏只数**显式的错误 supported**：把假的判成真的会让幻觉引用带着绿 chip 出门，
+   那才是 Citation Precision 的毒药。两个 eval 的口径在各自 docstring 里写明，不共享一个
+   「errored 算不算失败」的开关。
+4. **同一 citation_id 取最差**（contradicted < unbacked < uncertain < supported）：一篇文献
+   支撑 A 句、反驳 B 句时 chip 不能显示绿。排序本身由
+   `test_verdicts_and_rank_stay_in_sync` 钉着——加新词忘排序会在聚合处 KeyError，而不是
+   静默漏标。
+5. **`StructuredTool.from_coroutine` 在本仓库的 langchain-core 里不存在**（7 条图测试全红在
+   同一行）。地面真值是仓库自己的 `test_api.py::_search_tool` 模式：显式 `args_schema` dict
+   + `coroutine=` 参数。又一次「先找仓内先例再写代码」。
+6. **spec 阶段的一处设计被实现推翻，改在 spec 里留痕**：原计划的「from_predictions 与
+   from_expect 两套 Citation P/R 对照」是死路——数据构造规则就是「该支持的都支持」，
+   from_expect 恒为 1.0。harness 实际只报 from_predictions + 后端质量指标 + 泄漏率；
+   「产品数字可信吗」由后者回答，端到端 live 数字需要真实答案的人工标注，不在离线
+   harness 里谎报。
+7. **评测按 answer 组驱动而不是按行**：模拟生产调用形状（一条答案一次批量判定，backend
+   内部再分批）。整组异常 → 该组全 miss，不连累其余组。`citation_id` 在评测语料里只是
+   组内行号——产品语义的引用号属于 registry，评测不应假装自己有。
+8. **语料 provenance 是门禁不是自觉**：每行 note 必填且必须含「真实摘要 / 合成 span /
+   fixture」来源声明 token（`test_notes_are_nonempty_and_carry_provenance`）。g1 的 span
+   用 `upstream.reconstruct_abstract` 同款算法从 fixture 重建——真实摘要上的「supported /
+   contradicted」和合成 span 上的分开计数没有意义，所以没分口径，但来源必须可辨。
+9. **计时口径要标**：全套 86.13s（后台执行口径）看着比验收报告的 39.98s 慢一倍，但单跑
+   `packages/agent` 5.27s 反而快于本会话早前的 7.74s——慢在执行环境不在代码。前一次
+   160.79s 的 run 是和 ruff/evals 并发跑的，作废。
+
+**当前门禁**：**987 passed / 1 skipped / 86.13s**（后台口径；D8 收尾 616 → 中途含未提交
+工作区改动 922，本次净增 65：claims 9 · entailment 11 · verify 15 · graph 7 · API 6 ·
+数据门禁 7 · harness 算术 10）；`ruff check` 全绿；`ruff format --check` **87 files**
+already formatted。
+
+**仍未做**
+
+- **grounding eval 的 live run**：`uv run python -m evals --task grounding --backend small_llm`。
+  读 `.env` 的 key 打外部服务，按 D7 先例需要用户明文授权；DeepSeek 余额只剩 ¥3.14，
+  跑之前先充值（24 条 × 1 组内批量调用，成本可忽略，但顺序别反）。
+- **Jev 蕴含后端**：协议位已留（`EntailmentBackend`），卡同一把 `TYPESAFE_API_KEY`（与 D4
+  在线验收同源）。CLI 对 `--task grounding --backend jev` 给出的是「后端未建」的干净报错，
+  不是静默降级。
+- **前端渲染 `grounding` 事件**：`route` chip 的先例——后端先行，transport 已忽略未知事件。
+  「未获支持 → chip 标红」是下一步的前端活。
+- **优先级清单的 #2（Deep Path 最小版：section 级 drafter+verifier）与 #3（skill loader）**
+  未动——本日只兑现 #1。用户的三项清单还有两项。
+- 页级/句级 span（`SpanRef` 仍 null）、Deep Path Verifier→Drafter 诊断回退：仍是 Week 2/3 范畴。
+- 三把 key 轮换（DeepSeek / Langfuse / OpenAlex）：D8 遗留，不变。
+
+---
+
 - [x] ~~装 Docker Desktop~~ → **不需要了**，存储已本地化；Docker 留给 Week 4 部署
 - [x] ~~申请 Semantic Scholar API key（无 key 配额低到没法开发）~~ → **D5 没有靠它落地**：主力换成 **OpenAlex**（无 key 可用），Semantic Scholar 保留为按标识符路由的第二上游，代码与测试都写完了，没 key 时直接不启用。**实测无 key 的 S2 第一个请求就 429**，所以它降级为「有了更好」（它提供引用图谱与 field-of-study 过滤）。此行此前写的是「CrossRef / arXiv 无需 key」——那讲的是 `nature-academic-search` 那套 skill 的数据源，**不是 D5 实际实现的东西**，特此更正。
 - [x] ~~**D5 的 live 验收挂起**~~ → **已通过（2026-10-19）**：用户自己申请了免费 `OPENALEX_API_KEY`（免费档 $1/天，是无 key $0.10/天的 10×）填进 `.env`、重启网关，真跑 `search_papers` 返回真论文——45 条 `citation` 全带有效 DOI，模型引用其中 5 篇（CPC/MoCo/SimCLR/SupCon/SwAV），`markers_without_citation=[]`，grounding-by-construction 在真数据上成立。无 key 那两次 429（`retryAfter` 66013 / 45972）留作降级证据。详见本日 D6 devlog。
@@ -569,5 +659,6 @@ D3 验收时 Langfuse 的 `totalCost` 恒为 0，本来打算去后台建一个 
 - [x] ~~`.env` 已从 example 生成，API key 还是空的~~ → **DeepSeek key 已接入并实测通过**（见坑 12）。`CHECKPOINT_BACKEND=sqlite`。
 - [ ] **DeepSeek 余额只剩 ¥3.14（2026-10-14 实测）**。日常开发够用（flash 档单次工具调用约 500 token），但 Week 4 的评测套件（100 条 routing × 多轮 + grounding 逐 claim 蕴含校验）会很紧张，**跑评测前先充值**。
 - [ ] **轮换 DeepSeek key、Langfuse key、OpenAlex key**：三把都在聊天里明文发过一次，已落进本地 transcript。`.env` 里那几份能用（`.env` 已确认未被 git 跟踪），但都该到控制台重签。DeepSeek 泄露的是付费额度，Langfuse 泄露的是**全部 trace 的读权限——里面是完整 prompt 和用户文本**，后者优先级最高；OpenAlex 只是免费 $1/天额度，优先级最低。
+- [ ] **grounding eval 的 live run 待授权（D9）**：`uv run python -m evals --task grounding --backend small_llm`——读 `.env` 的 `LLM_API_KEY` 打 DeepSeek，按 D7 先例需要用户明文同意。语料 24 条起步（g1 是 OpenAlex fixture 的真实摘要，其余合成 span 已在 note 标注来源）；要长就刻意长，别凑数。生产档是 Jev 蕴含，卡 `TYPESAFE_API_KEY`（与 D4 在线验收同源）。前端渲染 `grounding` 事件是另一件活（`route` chip 先例：后端先行）。
 - [ ] TypeSafe(Jev) / Semantic Scholar 两个 key 仍为空。TypeSafe 只卡 D4 的**在线验收**；Semantic Scholar 只卡「引用图谱那一层更好的详情」。两者的代码与离线测试都已完成。**OpenAlex 已填并 live 验证通过（2026-10-19，免费 $1/天档）；Langfuse 已填。**
 - [x] ~~**D4 的 `Decisions` 尚未接进 `AgentState`**~~ → **D8 落地**（2026-10-22）。`graph/state.py` 现有 7 个 `NotRequired` 路由字段：`intent / guard / needs_clarify / path_deep / route_source / route_confidence / route_from_cache`，由 `route` 节点一起写；图读 `guard` 分支到 `proceed/clarify/refuse`，网关读其余发一条完整 `route` 事件。**注意口径**：docstring 早先预留的是 `intent / slots / missing_slots / guard / route_source` 五个——实际接进来的是上面七个，`slots / missing_slots` **仍未加**（没有节点读它们：`needs_clarify` 是单个 bit、clarify 文案是固定的；等文案要「按具体缺哪个 slot 生成」而不是「列全部选项」时它们才挣得位置）。`route` SSE 事件同批落地（见上一条）。

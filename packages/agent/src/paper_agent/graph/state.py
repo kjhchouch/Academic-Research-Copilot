@@ -25,9 +25,10 @@ Still planned, in the order they arrive:
         no node reads them yet: `needs_clarify` is a single bit and the clarify
         message is fixed. They earn their place only once that message is
         generated from the specific missing slot instead of listing every option.
-    Week 2  claims, spans, verdict, retry_count  -- grounding and the
-        Verifier -> Drafter loop. retry_count lives in state (not in a node
-        closure) so the bound survives a checkpoint restore.
+    D9  grounding, grounding_source -- 引用级标注已落地（supported / uncertain /
+        contradicted / unbacked，见 paper_agent.grounding）。尚未到位的是它的
+        Deep Path 一半：页级 span（SpanRef 仍为 null）与 Verifier→Drafter 的
+        诊断回退——那是另一张图的事。
     Week 3  retrieved  -- chunk ids and scores, not the chunk text. Large
         objects go to the blob store; a fat state makes every checkpoint write
         expensive and checkpoints get written often.
@@ -84,3 +85,12 @@ class AgentState(TypedDict):
     route_source: NotRequired[RouteSource | Literal["knowledge"]]
     route_confidence: NotRequired[float]
     route_from_cache: NotRequired[bool]
+
+    # --- D9 grounding 标注 ----------------------------------------------------
+    # `verify` 节点写。`grounding` 每项是 {citation_id, verdict, reason}，verdict 取
+    # paper_agent.grounding.VERDICTS 四值之一；`grounding_source` 记录判定来自哪个
+    # 后端（entailment.name），让 SSE 事件、checkpoint 和 trace 都带着出处——降级档
+    # 的标注不能被当成生产档的（与 route_source 同一条纪律）。verify 只写 state 不发
+    # 消息：核验结论进事件流和 checkpoint，不进对话历史，也不产生 token 事件。
+    grounding: NotRequired[list[dict[str, Any]]]
+    grounding_source: NotRequired[str | None]
